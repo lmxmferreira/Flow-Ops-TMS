@@ -1,0 +1,17 @@
+# Python
+api/.venv/
+api/__pycache__/
+api/app/**/__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Node
+web/node_modules/
+web/.next/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Migrations (keep sql files, ignore nothing)
