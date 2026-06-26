@@ -4101,3 +4101,230 @@ async def get_allocations_by_entity(
         "allocations":    rows,
         "shipment_count": len({r["shipment_id"] for r in rows}),
     }
+
+# ================================================================== #
+# TMS-RATE-013: Shipment Financial Views
+# Append this to the end of rating.py
+# ================================================================== #
+
+class ApproveFinancialRequest(BaseModel):
+    approved_amount: float
+    approval_notes: Optional[str] = None
+    target: str = "both"   # carrier | client | both
+
+
+@router.get("/financials/{shipment_id}")
+async def get_shipment_financials(
+    shipment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-013: Full financial view for a shipment.
+    Returns estimated cost, actual cost, billable amount,
+    gross margin, variance, and approved financial amount.
+    """
+    # Main financial summary
+    fin_result = await db.execute(text("""
+        SELECT * FROM tms.v_shipment_financials
+        WHERE shipment_id = CAST(:id AS uuid)
+    """), {"id": shipment_id})
+    fin = fin_result.mappings().one_or_none()
+    if not fin:
+        raise HTTPException(404, "Shipment not found.")
+    fin = dict(fin)
+
+    # Carrier cost line detail
+    carrier_result = await db.execute(text("""
+        SELECT
+            sc.cost_id, sc.charge_code, sc.charge_type, sc.description,
+            sc.quantity, sc.rate_amount, sc.amount,
+            sc.approved_amount, sc.approved_by, sc.approved_at,
+            sc.is_override, sc.is_estimated, sc.override_reason,
+            sc.currency, sc.rated_at, sc.rated_by
+        FROM tms.shipment_costs sc
+        WHERE sc.shipment_id = CAST(:id AS uuid)
+        ORDER BY sc.charge_type, sc.charge_code
+    """), {"id": shipment_id})
+    carrier_lines = [dict(r) for r in carrier_result.mappings().all()]
+
+    # Client charge line detail
+    client_result = await db.execute(text("""
+        SELECT
+            cc.client_charge_id, cc.charge_code, cc.charge_type, cc.description,
+            cc.amount, cc.markup_type, cc.markup_value, cc.markup_amount,
+            cc.approved_amount, cc.approved_by, cc.approved_at,
+            cc.tax_rate, cc.tax_amount, cc.currency, cc.billed_flag
+        FROM tms.client_charges cc
+        WHERE cc.shipment_id = CAST(:id AS uuid)
+        ORDER BY cc.charge_type, cc.charge_code
+    """), {"id": shipment_id})
+    client_lines = [dict(r) for r in client_result.mappings().all()]
+
+    # Build per-charge comparison
+    carrier_by_code: dict = {}
+    for c in carrier_lines:
+        key = c["charge_code"]
+        carrier_by_code.setdefault(key, 0)
+        carrier_by_code[key] += float(c.get("approved_amount") or c["amount"])
+
+    charge_comparison = []
+    for cl in client_lines:
+        key = cl["charge_code"]
+        buy  = carrier_by_code.get(key, 0)
+        sell = float(cl["amount"])
+        charge_comparison.append({
+            "charge_code":   key,
+            "charge_type":   cl["charge_type"],
+            "description":   cl["description"],
+            "carrier_cost":  buy,
+            "client_charge": sell,
+            "markup":        round(sell - buy, 2),
+            "markup_pct":    round((sell - buy) / buy * 100, 2) if buy > 0 else None,
+            "approved":      float(cl["approved_amount"]) if cl.get("approved_amount") else None,
+            "billed":        cl["billed_flag"],
+        })
+
+    return {
+        "shipment_id":     shipment_id,
+        "shipment_number": fin.get("shipment_number"),
+        "currency":        fin.get("currency", "USD"),
+        "financials": {
+            "estimated_carrier_cost":    float(fin.get("estimated_carrier_cost") or 0),
+            "actual_carrier_cost":       float(fin.get("actual_carrier_cost") or 0),
+            "total_carrier_cost":        float(fin.get("total_carrier_cost") or 0),
+            "client_billable_amount":    float(fin.get("client_billable_amount") or 0),
+            "approved_financial_amount": float(fin.get("approved_financial_amount") or 0),
+            "gross_margin":              float(fin.get("gross_margin") or 0),
+            "gross_margin_pct":          float(fin.get("gross_margin_pct") or 0),
+            "variance":                  float(fin.get("variance") or 0),
+        },
+        "flags": {
+            "has_overrides":  fin.get("has_overrides", False),
+            "has_approvals":  fin.get("has_approvals", False),
+            "carrier_lines":  fin.get("carrier_cost_lines", 0),
+            "client_lines":   fin.get("client_charge_lines", 0),
+            "last_rated_at":  str(fin["last_rated_at"]) if fin.get("last_rated_at") else None,
+            "last_billed_at": str(fin["last_billed_at"]) if fin.get("last_billed_at") else None,
+        },
+        "carrier_costs":       carrier_lines,
+        "client_charges":      client_lines,
+        "charge_comparison":   charge_comparison,
+    }
+
+
+@router.get("/financials")
+async def get_financials_summary(
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-013: Aggregated financial report across shipments.
+    Shows estimated vs actual cost, billable, margin, and variance per shipment.
+    """
+    from datetime import date as _date
+    conditions = ["1=1"]
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+
+    if from_date:
+        conditions.append("s.created_at >= CAST(:from_date AS date)")
+        params["from_date"] = _date.fromisoformat(from_date)
+    if to_date:
+        conditions.append("s.created_at <= CAST(:to_date AS date)")
+        params["to_date"] = _date.fromisoformat(to_date)
+
+    where = " AND ".join(conditions)
+
+    result = await db.execute(text(f"""
+        SELECT vf.*
+        FROM tms.v_shipment_financials vf
+        JOIN tms.shipments s ON s.shipment_id = vf.shipment_id
+        WHERE {where}
+        ORDER BY vf.last_rated_at DESC NULLS LAST
+        LIMIT :limit OFFSET :offset
+    """), params)
+    rows = [dict(r) for r in result.mappings().all()]
+
+    # Aggregate totals
+    total_carrier  = sum(float(r.get("total_carrier_cost") or 0) for r in rows)
+    total_billable = sum(float(r.get("client_billable_amount") or 0) for r in rows)
+    total_margin   = sum(float(r.get("gross_margin") or 0) for r in rows)
+    total_variance = sum(float(r.get("variance") or 0) for r in rows)
+
+    return {
+        "shipments":        rows,
+        "count":            len(rows),
+        "totals": {
+            "total_carrier_cost":      round(total_carrier, 2),
+            "total_billable_amount":   round(total_billable, 2),
+            "total_gross_margin":      round(total_margin, 2),
+            "total_variance":          round(total_variance, 2),
+            "avg_margin_pct":          round(total_margin / total_billable * 100, 2) if total_billable > 0 else 0,
+            "currency":                "USD",
+        },
+    }
+
+
+@router.patch("/financials/{shipment_id}/approve")
+async def approve_shipment_financials(
+    shipment_id: str,
+    payload: ApproveFinancialRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Approve the financial amount for a shipment.
+    Sets approved_amount on carrier costs and/or client charges.
+    """
+    user_id = current_user.get("email", "system")
+    updated = {"carrier": 0, "client": 0}
+
+    if payload.target in ("carrier", "both"):
+        result = await db.execute(text("""
+            UPDATE tms.shipment_costs
+            SET approved_amount = :amount,
+                approved_by     = :user,
+                approved_at     = NOW(),
+                updated_at      = NOW()
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"amount": payload.approved_amount, "user": user_id, "id": shipment_id})
+        updated["carrier"] = result.rowcount
+
+    if payload.target in ("client", "both"):
+        result = await db.execute(text("""
+            UPDATE tms.client_charges
+            SET approved_amount = :amount,
+                approved_by     = :user,
+                approved_at     = NOW(),
+                updated_at      = NOW()
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"amount": payload.approved_amount, "user": user_id, "id": shipment_id})
+        updated["client"] = result.rowcount
+
+    await db.commit()
+
+    # Return updated financials
+    fin_result = await db.execute(text("""
+        SELECT * FROM tms.v_shipment_financials WHERE shipment_id = CAST(:id AS uuid)
+    """), {"id": shipment_id})
+    fin = dict(fin_result.mappings().one())
+
+    return {
+        "shipment_id":       shipment_id,
+        "approved_by":       user_id,
+        "approved_amount":   payload.approved_amount,
+        "lines_updated":     updated,
+        "financials": {
+            "estimated_carrier_cost":    float(fin.get("estimated_carrier_cost") or 0),
+            "actual_carrier_cost":       float(fin.get("actual_carrier_cost") or 0),
+            "client_billable_amount":    float(fin.get("client_billable_amount") or 0),
+            "approved_financial_amount": float(fin.get("approved_financial_amount") or 0),
+            "gross_margin":              float(fin.get("gross_margin") or 0),
+            "gross_margin_pct":          float(fin.get("gross_margin_pct") or 0),
+            "variance":                  float(fin.get("variance") or 0),
+        },
+    }
