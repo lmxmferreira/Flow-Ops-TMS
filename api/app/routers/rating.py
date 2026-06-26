@@ -3758,3 +3758,346 @@ async def apply_billing_rules(
             "currency":      "USD",
         },
     }
+
+# ================================================================== #
+# TMS-RATE-012: Billing Rate Allocation Across Multiple Levels
+# Append this to the end of rating.py
+# ================================================================== #
+
+class AllocationLineInput(BaseModel):
+    allocation_type: str   # shipment|stop|order_release|po_header|po_line|customer|project|cost_center
+    entity_id: str         # UUID of the entity at that level
+    allocation_pct: Optional[float] = None    # manual override
+    allocation_amount: Optional[float] = None # manual override
+
+class AllocateChargesRequest(BaseModel):
+    shipment_id: str
+    allocation_basis: str = "equal"   # equal|weight|value|volume|manual
+    levels: list[str] = ["shipment"]  # which levels to allocate to
+    # e.g. ["stop","po_header","po_line"]
+    manual_allocations: Optional[list[AllocationLineInput]] = None
+    use_client_charges: bool = True   # if False, use carrier costs
+
+
+@router.post("/allocations", status_code=201)
+async def allocate_charges(
+    payload: AllocateChargesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-012: Allocate charges across multiple levels.
+    Supports shipment, stop, order_release, PO header, PO line,
+    customer, project, and cost center allocation.
+    """
+    user_id = current_user.get("email", "system")
+
+    # Load charges to allocate
+    if payload.use_client_charges:
+        charges_result = await db.execute(text("""
+            SELECT client_charge_id AS charge_id, charge_code, charge_type,
+                   description, amount, currency
+            FROM tms.client_charges
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": payload.shipment_id})
+    else:
+        charges_result = await db.execute(text("""
+            SELECT cost_id AS charge_id, charge_code, charge_type,
+                   description, amount, currency
+            FROM tms.shipment_costs
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": payload.shipment_id})
+
+    charges = [dict(r) for r in charges_result.mappings().all()]
+    if not charges:
+        raise HTTPException(422, "No charges found to allocate.")
+
+    total_amount = sum(Decimal(str(c["amount"])) for c in charges)
+    saved = []
+
+    # ── Manual allocations ─────────────────────────────────────────
+    if payload.allocation_basis == "manual" and payload.manual_allocations:
+        for alloc in payload.manual_allocations:
+            for charge in charges:
+                amount = charge["amount"]
+                if alloc.allocation_amount is not None:
+                    alloc_amount = Decimal(str(alloc.allocation_amount))
+                    alloc_pct    = (alloc_amount / Decimal(str(amount)) * 100).quantize(Decimal("0.01")) if amount else Decimal("0")
+                elif alloc.allocation_pct is not None:
+                    alloc_pct    = Decimal(str(alloc.allocation_pct))
+                    alloc_amount = (Decimal(str(amount)) * alloc_pct / 100).quantize(Decimal("0.01"))
+                else:
+                    continue
+
+                entity_col = _get_entity_col(alloc.allocation_type)
+                result = await db.execute(text(f"""
+                    INSERT INTO tms.charge_allocations
+                        ({_charge_col(payload.use_client_charges)}, allocation_type, {entity_col + chr(44) + " shipment_id" if entity_col != "shipment_id" else "shipment_id"}, allocation_basis, allocation_pct, allocation_amount,
+                         currency, created_by)
+                    VALUES
+                        (CAST(:charge_id AS uuid), :alloc_type, {("CAST(:entity_id AS uuid), " if entity_col != "shipment_id" else "") + "CAST(:shipment_id AS uuid)"}, :basis, :pct, :amount,
+                         :currency, :created_by)
+                    RETURNING allocation_id
+                """), {
+                    "charge_id":   str(charge["charge_id"]),
+                    "alloc_type":  alloc.allocation_type,
+                    "entity_id":   alloc.entity_id,
+                    "shipment_id": payload.shipment_id,
+                    "basis":       "manual",
+                    "pct":         float(alloc_pct),
+                    "amount":      float(alloc_amount),
+                    "currency":    charge["currency"],
+                    "created_by":  user_id,
+                })
+                saved.append({"allocation_id": str(result.scalar()), "charge_id": str(charge["charge_id"]),
+                               "type": alloc.allocation_type, "entity_id": alloc.entity_id,
+                               "amount": float(alloc_amount), "pct": float(alloc_pct)})
+        await db.commit()
+        return {"shipment_id": payload.shipment_id, "allocations": saved, "total": len(saved)}
+
+    # ── Auto allocations by level ──────────────────────────────────
+    for level in payload.levels:
+        entities = await _get_entities_for_level(db, payload.shipment_id, level)
+        if not entities:
+            # No entities found for this level, skip
+            continue
+
+        n = len(entities)
+        entity_col = _get_entity_col(level)
+
+        for charge in charges:
+            charge_amount = Decimal(str(charge["amount"]))
+
+            for i, entity in enumerate(entities):
+                # Calculate allocation split
+                if payload.allocation_basis == "equal":
+                    alloc_pct    = Decimal("100") / n
+                    alloc_amount = (charge_amount / n).quantize(Decimal("0.01"))
+                    # Last entity gets rounding remainder
+                    if i == n - 1:
+                        alloc_amount = charge_amount - sum(
+                            (charge_amount / n).quantize(Decimal("0.01")) for _ in range(n-1)
+                        )
+                elif payload.allocation_basis == "weight":
+                    total_w  = sum(Decimal(str(e.get("weight", 1) or 1)) for e in entities)
+                    w        = Decimal(str(entity.get("weight", 1) or 1))
+                    alloc_pct = (w / total_w * 100).quantize(Decimal("0.01"))
+                    alloc_amount = (charge_amount * w / total_w).quantize(Decimal("0.01"))
+                elif payload.allocation_basis == "value":
+                    total_v  = sum(Decimal(str(e.get("value", 1) or 1)) for e in entities)
+                    v        = Decimal(str(entity.get("value", 1) or 1))
+                    alloc_pct = (v / total_v * 100).quantize(Decimal("0.01"))
+                    alloc_amount = (charge_amount * v / total_v).quantize(Decimal("0.01"))
+                else:
+                    alloc_pct    = Decimal("100") / n
+                    alloc_amount = (charge_amount / n).quantize(Decimal("0.01"))
+
+                result = await db.execute(text(f"""
+                    INSERT INTO tms.charge_allocations
+                        ({_charge_col(payload.use_client_charges)}, allocation_type, {entity_col + chr(44) + " shipment_id" if entity_col != "shipment_id" else "shipment_id"}, allocation_basis, allocation_pct, allocation_amount,
+                         currency, created_by)
+                    VALUES
+                        (CAST(:charge_id AS uuid), :alloc_type, {("CAST(:entity_id AS uuid), " if entity_col != "shipment_id" else "") + "CAST(:shipment_id AS uuid)"}, :basis, :pct, :amount,
+                         :currency, :created_by)
+                    RETURNING allocation_id
+                """), {
+                    "charge_id":   str(charge["charge_id"]),
+                    "alloc_type":  level,
+                    "entity_id":   entity["id"],
+                    "shipment_id": payload.shipment_id,
+                    "basis":       payload.allocation_basis,
+                    "pct":         float(alloc_pct),
+                    "amount":      float(alloc_amount),
+                    "currency":    charge["currency"],
+                    "created_by":  user_id,
+                })
+                saved.append({
+                    "allocation_id": str(result.scalar()),
+                    "charge_id":     str(charge["charge_id"]),
+                    "charge_code":   charge["charge_code"],
+                    "level":         level,
+                    "entity_id":     entity["id"],
+                    "allocation_pct":float(alloc_pct),
+                    "allocation_amount": float(alloc_amount),
+                    "currency":      charge["currency"],
+                })
+
+    await db.commit()
+
+    level_summary = {}
+    for a in saved:
+        level_summary.setdefault(a["level"], {"count": 0, "total": 0})
+        level_summary[a["level"]]["count"] += 1
+        level_summary[a["level"]]["total"] += a["allocation_amount"]
+
+    return {
+        "shipment_id":      payload.shipment_id,
+        "allocation_basis": payload.allocation_basis,
+        "levels":           payload.levels,
+        "total_charges":    float(total_amount),
+        "allocations":      saved,
+        "level_summary":    level_summary,
+        "total_allocations":len(saved),
+    }
+
+
+def _charge_col(use_client: bool) -> str:
+    return "client_charge_id" if use_client else "shipment_cost_id"
+
+def _get_entity_col(level: str) -> str:
+    mapping = {
+        "shipment":      "shipment_id",
+        "stop":          "stop_id",
+        "order_release": "release_id",
+        "po_header":     "purchase_order_id",
+        "po_line":       "po_line_id",
+        "customer":      "customer_party_id",
+        "project":       "project_id",
+        "cost_center":   "cost_center_id",
+    }
+    return mapping.get(level, "shipment_id")
+
+async def _get_entities_for_level(db, shipment_id: str, level: str) -> list[dict]:
+    """Get entities linked to a shipment at the requested allocation level."""
+    if level == "stop":
+        result = await db.execute(text("""
+            SELECT shipment_stop_id AS id,
+                   1 AS weight,
+                   1 AS value
+            FROM tms.shipment_stops
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": shipment_id})
+        return [dict(r) for r in result.mappings().all()]
+
+    elif level == "po_header":
+        result = await db.execute(text("""
+            SELECT DISTINCT pol.purchase_order_id AS id,
+                   COALESCE(SUM(pol.ordered_quantity), 1) AS weight,
+                   COALESCE(SUM(pol.line_value), 1) AS value
+            FROM tms.order_release_lines orl
+            JOIN tms.purchase_order_lines pol ON pol.purchase_order_line_id = orl.purchase_order_line_id
+            JOIN tms.order_releases ore ON ore.release_id = orl.release_id
+            WHERE ore.shipment_id = CAST(:id AS uuid)
+            GROUP BY pol.purchase_order_id
+        """), {"id": shipment_id})
+        rows = [dict(r) for r in result.mappings().all()]
+        return rows if rows else []
+
+    elif level == "po_line":
+        result = await db.execute(text("""
+            SELECT pol.purchase_order_line_id AS id,
+                   COALESCE(pol.ordered_quantity, 1) AS weight,
+                   COALESCE(pol.line_value, 1) AS value
+            FROM tms.order_release_lines orl
+            JOIN tms.purchase_order_lines pol ON pol.purchase_order_line_id = orl.purchase_order_line_id
+            JOIN tms.order_releases ore ON ore.release_id = orl.release_id
+            WHERE ore.shipment_id = CAST(:id AS uuid)
+        """), {"id": shipment_id})
+        rows = [dict(r) for r in result.mappings().all()]
+        return rows if rows else []
+
+    elif level == "customer":
+        result = await db.execute(text("""
+            SELECT customer_party_id AS id, 1 AS weight, 1 AS value
+            FROM tms.shipments WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": shipment_id})
+        row = result.mappings().one_or_none()
+        return [dict(row)] if row and row["id"] else []
+
+    elif level == "cost_center":
+        result = await db.execute(text("""
+            SELECT DISTINCT pol.purchase_order_id AS id, 1 AS weight, 1 AS value
+            FROM tms.order_release_lines orl
+            JOIN tms.purchase_order_lines pol ON pol.purchase_order_line_id = orl.purchase_order_line_id
+            JOIN tms.order_releases ore ON ore.release_id = orl.release_id
+            WHERE ore.shipment_id = CAST(:id AS uuid)
+        """), {"id": shipment_id})
+        return [dict(r) for r in result.mappings().all()]
+
+    # Default: shipment level
+    return [{"id": shipment_id, "weight": 1, "value": 1}]
+
+
+@router.get("/allocations/{shipment_id}")
+async def get_allocations(
+    shipment_id: str,
+    level: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get all charge allocations for a shipment, optionally filtered by level."""
+    conditions = ["ca.shipment_id = CAST(:id AS uuid)"]
+    params: dict[str, Any] = {"id": shipment_id}
+    if level:
+        conditions.append("ca.allocation_type = :level")
+        params["level"] = level
+
+    result = await db.execute(text(f"""
+        SELECT
+            ca.*,
+            COALESCE(cc.charge_code, sc.charge_code)  AS charge_code,
+            COALESCE(cc.charge_type, sc.charge_type)  AS charge_type,
+            COALESCE(cc.description, sc.description)  AS description,
+            COALESCE(cc.amount,      sc.amount)        AS source_amount
+        FROM tms.charge_allocations ca
+        LEFT JOIN tms.client_charges  cc ON cc.client_charge_id = ca.client_charge_id
+        LEFT JOIN tms.shipment_costs  sc ON sc.cost_id          = ca.shipment_cost_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY ca.allocation_type, ca.charge_code
+    """), params)
+    rows = [dict(r) for r in result.mappings().all()]
+    total = sum(float(r["allocation_amount"]) for r in rows)
+
+    by_level: dict = {}
+    for r in rows:
+        lvl = r["allocation_type"]
+        by_level.setdefault(lvl, {"lines": [], "total": 0})
+        by_level[lvl]["lines"].append(r)
+        by_level[lvl]["total"] += float(r["allocation_amount"])
+
+    return {
+        "shipment_id":    shipment_id,
+        "total_allocated":round(total, 2),
+        "by_level":       by_level,
+        "all_allocations":rows,
+    }
+
+
+@router.get("/allocations/by-entity/{entity_type}/{entity_id}")
+async def get_allocations_by_entity(
+    entity_type: str,
+    entity_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Get all charge allocations attributed to a specific entity.
+    entity_type: po_header | po_line | cost_center | project | customer | stop
+    """
+    col = _get_entity_col(entity_type)
+    result = await db.execute(text(f"""
+        SELECT
+            ca.*,
+            COALESCE(cc.charge_code, sc.charge_code)  AS charge_code,
+            COALESCE(cc.charge_type, sc.charge_type)  AS charge_type,
+            COALESCE(cc.description, sc.description)  AS description,
+            COALESCE(cc.amount,      sc.amount)        AS source_amount,
+            s.shipment_number
+        FROM tms.charge_allocations ca
+        LEFT JOIN tms.client_charges cc ON cc.client_charge_id = ca.client_charge_id
+        LEFT JOIN tms.shipment_costs sc ON sc.cost_id          = ca.shipment_cost_id
+        LEFT JOIN tms.shipments      s  ON s.shipment_id       = ca.shipment_id
+        WHERE ca.{col} = CAST(:entity_id AS uuid)
+          AND ca.allocation_type = :entity_type
+        ORDER BY ca.created_at DESC
+    """), {"entity_id": entity_id, "entity_type": entity_type})
+    rows = [dict(r) for r in result.mappings().all()]
+    total = sum(float(r["allocation_amount"]) for r in rows)
+
+    return {
+        "entity_type":    entity_type,
+        "entity_id":      entity_id,
+        "total_allocated":round(total, 2),
+        "allocations":    rows,
+        "shipment_count": len({r["shipment_id"] for r in rows}),
+    }
