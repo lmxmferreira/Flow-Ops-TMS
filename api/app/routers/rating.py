@@ -4606,3 +4606,356 @@ async def get_rerate_history(
         "rerate_count": len(rows),
         "history":      rows,
     }
+
+# ================================================================== #
+# TMS-RATE-015: Manual Charges, Adjustments, Overrides & Approvals
+# Append this to the end of rating.py
+# ================================================================== #
+
+class ManualChargeRequest(BaseModel):
+    charge_code: str
+    charge_type: str = "manual"
+    description: str
+    amount: float
+    currency: str = "USD"
+    quantity: Optional[float] = None
+    rate_amount: Optional[float] = None
+    reason_code: str
+    notes: Optional[str] = None
+    target: str = "carrier"  # carrier | client
+
+class AdjustmentRequest(BaseModel):
+    adjustment_amount: float   # can be negative (credit)
+    reason_code: str
+    notes: Optional[str] = None
+    new_amount: Optional[float] = None  # if set, replaces the amount entirely
+
+class ApprovalRequest(BaseModel):
+    reason_code: str = "APPROVED_OVERRIDE"
+    notes: Optional[str] = None
+    approved_amount: Optional[float] = None  # if different from billed
+
+class ReasonCodeCreate(BaseModel):
+    reason_code: str
+    description: str
+    category: str = "adjustment"
+    applies_to: list[str] = ["carrier", "client"]
+    requires_approval: bool = False
+
+
+# ── Reason Codes ──────────────────────────────────────────────────
+
+@router.get("/reason-codes")
+async def list_reason_codes(
+    db: AsyncSession = Depends(get_db),
+    category: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
+    conditions = ["is_active = TRUE"]
+    params: dict[str, Any] = {}
+    if category:
+        conditions.append("category = :category")
+        params["category"] = category
+    result = await db.execute(text(f"""
+        SELECT * FROM tms.adjustment_reason_codes
+        WHERE {' AND '.join(conditions)}
+        ORDER BY category, reason_code
+    """), params)
+    return [dict(r) for r in result.mappings().all()]
+
+
+@router.post("/reason-codes", status_code=201)
+async def create_reason_code(
+    payload: ReasonCodeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        INSERT INTO tms.adjustment_reason_codes
+            (reason_code, description, category, applies_to, requires_approval)
+        VALUES (:reason_code, :description, :category, :applies_to, :requires_approval)
+        RETURNING *
+    """), payload.model_dump())
+    await db.commit()
+    return dict(result.mappings().one())
+
+
+# ── Manual Charge Entry ───────────────────────────────────────────
+
+@router.post("/shipment-costs/{shipment_id}/manual-charge", status_code=201)
+async def add_manual_charge(
+    shipment_id: str,
+    payload: ManualChargeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-015: Add a manual charge to a shipment with a reason code.
+    Can target carrier costs or client charges.
+    """
+    user_id = current_user.get("email", "system")
+
+    # Validate reason code exists
+    rc_result = await db.execute(text("""
+        SELECT * FROM tms.adjustment_reason_codes
+        WHERE reason_code = :code AND is_active = TRUE
+    """), {"code": payload.reason_code})
+    rc = rc_result.mappings().one_or_none()
+    if not rc:
+        raise HTTPException(400, f"Invalid or inactive reason code: {payload.reason_code}")
+
+    if payload.target == "carrier":
+        result = await db.execute(text("""
+            INSERT INTO tms.shipment_costs
+                (shipment_id, charge_code, charge_type, description,
+                 quantity, rate_amount, amount, currency,
+                 is_override, override_reason, rated_by)
+            VALUES
+                (CAST(:shipment_id AS uuid), :charge_code, :charge_type, :description,
+                 :quantity, :rate_amount, :amount, :currency,
+                 TRUE, :reason, :rated_by)
+            RETURNING *
+        """), {
+            "shipment_id":  shipment_id,
+            "charge_code":  payload.charge_code,
+            "charge_type":  payload.charge_type,
+            "description":  payload.description,
+            "quantity":     payload.quantity,
+            "rate_amount":  payload.rate_amount or payload.amount,
+            "amount":       payload.amount,
+            "currency":     payload.currency,
+            "reason":       f"{payload.reason_code}: {payload.notes or ''}".strip(": "),
+            "rated_by":     user_id,
+        })
+        row = dict(result.mappings().one())
+
+    else:  # client
+        result = await db.execute(text("""
+            INSERT INTO tms.client_charges
+                (shipment_id, charge_code, charge_type, description,
+                 quantity, rate_amount, amount, currency,
+                 markup_type, markup_value, markup_amount,
+                 is_override, override_reason, created_by)
+            VALUES
+                (CAST(:shipment_id AS uuid), :charge_code, :charge_type, :description,
+                 :quantity, :rate_amount, :amount, :currency,
+                 'none', 0, 0,
+                 TRUE, :reason, :created_by)
+            RETURNING *
+        """), {
+            "shipment_id":  shipment_id,
+            "charge_code":  payload.charge_code,
+            "charge_type":  payload.charge_type,
+            "description":  payload.description,
+            "quantity":     payload.quantity,
+            "rate_amount":  payload.rate_amount or payload.amount,
+            "amount":       payload.amount,
+            "currency":     payload.currency,
+            "reason":       f"{payload.reason_code}: {payload.notes or ''}".strip(": "),
+            "created_by":   user_id,
+        })
+        row = dict(result.mappings().one())
+
+    await db.commit()
+
+    return {
+        "message":       f"Manual {payload.target} charge added.",
+        "charge":        row,
+        "reason_code":   payload.reason_code,
+        "reason_label":  dict(rc)["description"],
+        "entered_by":    user_id,
+        "target":        payload.target,
+    }
+
+
+# ── Adjustments ───────────────────────────────────────────────────
+
+@router.patch("/shipment-costs/{cost_id}/adjust")
+async def adjust_cost(
+    cost_id: str,
+    payload: AdjustmentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-015: Adjust an existing carrier cost line with a reason code.
+    """
+    user_id = current_user.get("email", "system")
+
+    # Validate reason code
+    rc_result = await db.execute(text("""
+        SELECT * FROM tms.adjustment_reason_codes
+        WHERE reason_code = :code AND is_active = TRUE
+    """), {"code": payload.reason_code})
+    rc = rc_result.mappings().one_or_none()
+    if not rc:
+        raise HTTPException(400, f"Invalid reason code: {payload.reason_code}")
+
+    # Load current cost
+    cost_result = await db.execute(text("""
+        SELECT * FROM tms.shipment_costs WHERE cost_id = CAST(:id AS uuid)
+    """), {"id": cost_id})
+    cost = cost_result.mappings().one_or_none()
+    if not cost:
+        raise HTTPException(404, "Cost line not found.")
+
+    old_amount = float(cost["amount"])
+    if payload.new_amount is not None:
+        new_amount = payload.new_amount
+    else:
+        new_amount = old_amount + payload.adjustment_amount
+
+    result = await db.execute(text("""
+        UPDATE tms.shipment_costs
+        SET amount          = :new_amount,
+            is_override     = TRUE,
+            override_reason = :reason,
+            rated_by        = :rated_by,
+            updated_at      = NOW()
+        WHERE cost_id = CAST(:id AS uuid)
+        RETURNING *
+    """), {
+        "new_amount": new_amount,
+        "reason":     f"{payload.reason_code}: {payload.notes or ''}".strip(": "),
+        "rated_by":   user_id,
+        "id":         cost_id,
+    })
+    await db.commit()
+    row = dict(result.mappings().one())
+
+    return {
+        "cost_id":        cost_id,
+        "old_amount":     old_amount,
+        "adjustment":     payload.adjustment_amount,
+        "new_amount":     new_amount,
+        "delta":          round(new_amount - old_amount, 2),
+        "reason_code":    payload.reason_code,
+        "reason_label":   dict(rc)["description"],
+        "adjusted_by":    user_id,
+        "cost":           row,
+    }
+
+
+@router.patch("/client-charges/{charge_id}/adjust")
+async def adjust_client_charge(
+    charge_id: str,
+    payload: AdjustmentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Adjust a client charge line with reason code."""
+    user_id = current_user.get("email", "system")
+
+    rc_result = await db.execute(text("""
+        SELECT description FROM tms.adjustment_reason_codes
+        WHERE reason_code = :code AND is_active = TRUE
+    """), {"code": payload.reason_code})
+    rc = rc_result.mappings().one_or_none()
+    if not rc:
+        raise HTTPException(400, f"Invalid reason code: {payload.reason_code}")
+
+    charge_result = await db.execute(text("""
+        SELECT * FROM tms.client_charges WHERE client_charge_id = CAST(:id AS uuid)
+    """), {"id": charge_id})
+    charge = charge_result.mappings().one_or_none()
+    if not charge:
+        raise HTTPException(404, "Client charge not found.")
+
+    old_amount = float(charge["amount"])
+    new_amount = payload.new_amount if payload.new_amount is not None else old_amount + payload.adjustment_amount
+
+    result = await db.execute(text("""
+        UPDATE tms.client_charges
+        SET amount          = :new_amount,
+            is_override     = TRUE,
+            override_reason = :reason,
+            updated_at      = NOW()
+        WHERE client_charge_id = CAST(:id AS uuid)
+        RETURNING *
+    """), {
+        "new_amount": new_amount,
+        "reason":     f"{payload.reason_code}: {payload.notes or ''}".strip(": "),
+        "id":         charge_id,
+    })
+    await db.commit()
+
+    return {
+        "charge_id":   charge_id,
+        "old_amount":  old_amount,
+        "new_amount":  new_amount,
+        "delta":       round(new_amount - old_amount, 2),
+        "reason_code": payload.reason_code,
+        "adjusted_by": user_id,
+    }
+
+
+# ── Approvals ─────────────────────────────────────────────────────
+
+@router.post("/client-charges/{shipment_id}/approve")
+async def approve_client_charges(
+    shipment_id: str,
+    payload: ApprovalRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-015: Formally approve client charges for a shipment.
+    Sets approved_amount, approved_by, approved_at on all client charge lines.
+    """
+    user_id = current_user.get("email", "system")
+
+    rc_result = await db.execute(text("""
+        SELECT description FROM tms.adjustment_reason_codes
+        WHERE reason_code = :code AND is_active = TRUE
+    """), {"code": payload.reason_code})
+    rc = rc_result.mappings().one_or_none()
+    if not rc:
+        raise HTTPException(400, f"Invalid reason code: {payload.reason_code}")
+
+    # Load current client charges
+    charges_result = await db.execute(text("""
+        SELECT client_charge_id, amount FROM tms.client_charges
+        WHERE shipment_id = CAST(:id AS uuid)
+    """), {"id": shipment_id})
+    charges = [dict(r) for r in charges_result.mappings().all()]
+
+    if not charges:
+        raise HTTPException(422, "No client charges found for this shipment.")
+
+    total_billed   = sum(float(c["amount"]) for c in charges)
+    approved_per   = payload.approved_amount  # if set, split equally; else use actual
+
+    approved_count = 0
+    for charge in charges:
+        per_charge = approved_per / len(charges) if approved_per else float(charge["amount"])
+        await db.execute(text("""
+            UPDATE tms.client_charges
+            SET approved_amount = :approved,
+                approved_by     = :user,
+                approved_at     = NOW(),
+                override_reason = COALESCE(override_reason, :reason),
+                updated_at      = NOW()
+            WHERE client_charge_id = CAST(:id AS uuid)
+        """), {
+            "approved": per_charge,
+            "user":     user_id,
+            "reason":   f"{payload.reason_code}: {payload.notes or ''}".strip(": "),
+            "id":       str(charge["client_charge_id"]),
+        })
+        approved_count += 1
+
+    await db.commit()
+
+    total_approved = payload.approved_amount or total_billed
+
+    return {
+        "shipment_id":     shipment_id,
+        "approved_by":     user_id,
+        "reason_code":     payload.reason_code,
+        "reason_label":    dict(rc)["description"],
+        "charges_approved":approved_count,
+        "total_billed":    round(total_billed, 2),
+        "total_approved":  round(total_approved, 2),
+        "variance":        round(total_approved - total_billed, 2),
+        "notes":           payload.notes,
+    }
