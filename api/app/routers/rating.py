@@ -3410,3 +3410,351 @@ async def get_shipment_margin(
         },
         "comparison": comparison,
     }
+
+# ================================================================== #
+# TMS-RATE-011: Client-Specific Billing Rules Engine
+# Append this to the end of rating.py
+# ================================================================== #
+
+import json as _json
+
+class BillingRuleCreate(BaseModel):
+    customer_party_id: str
+    rule_name: str
+    rule_type: str   # markup|margin|pass_through|management_fee|fixed_fee|minimum_billing|fsc_billing
+    applies_to_modes: list[str] = ["FTL","LTL","Parcel"]
+    applies_to_charges: list[str] = ["all"]
+    rule_params: dict = {}
+    priority: int = 0
+    effective_date: Optional[str] = None
+    expiry_date: Optional[str] = None
+    notes: Optional[str] = None
+
+class BillingRuleUpdate(BaseModel):
+    rule_name: Optional[str] = None
+    applies_to_modes: Optional[list[str]] = None
+    applies_to_charges: Optional[list[str]] = None
+    rule_params: Optional[dict] = None
+    priority: Optional[int] = None
+    effective_date: Optional[str] = None
+    expiry_date: Optional[str] = None
+    is_active: Optional[bool] = None
+    notes: Optional[str] = None
+
+class ApplyBillingRulesRequest(BaseModel):
+    shipment_id: str
+    customer_party_id: str
+    mode: str = "FTL"
+    replace_existing: bool = True
+    as_of_date: Optional[str] = None
+
+
+# ── CRUD for billing rules ────────────────────────────────────────
+
+@router.get("/billing-rules")
+async def list_billing_rules(
+    db: AsyncSession = Depends(get_db),
+    customer_party_id: Optional[str] = Query(None),
+    rule_type: Optional[str] = Query(None),
+    active_only: bool = Query(True),
+    current_user: dict = Depends(get_current_user),
+):
+    conditions = ["1=1"]
+    params: dict[str, Any] = {}
+    if customer_party_id:
+        conditions.append("r.customer_party_id = CAST(:cid AS uuid)")
+        params["cid"] = customer_party_id
+    if rule_type:
+        conditions.append("r.rule_type = :rule_type")
+        params["rule_type"] = rule_type
+    if active_only:
+        conditions.append("r.is_active = TRUE")
+        conditions.append("r.effective_date <= CURRENT_DATE")
+        conditions.append("(r.expiry_date IS NULL OR r.expiry_date >= CURRENT_DATE)")
+
+    where = " AND ".join(conditions)
+    result = await db.execute(text(f"""
+        SELECT r.*, p.party_name AS customer_name, p.party_code AS customer_code
+        FROM tms.client_billing_rules r
+        JOIN tms.parties p ON p.party_id = r.customer_party_id
+        WHERE {where}
+        ORDER BY r.priority, r.rule_type
+    """), params)
+    return [dict(r) for r in result.mappings().all()]
+
+
+@router.post("/billing-rules", status_code=201)
+async def create_billing_rule(
+    payload: BillingRuleCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    from datetime import date as _date
+    eff = _date.fromisoformat(payload.effective_date) if payload.effective_date else _date.today()
+    exp = _date.fromisoformat(payload.expiry_date) if payload.expiry_date else None
+    result = await db.execute(text("""
+        INSERT INTO tms.client_billing_rules
+            (customer_party_id, rule_name, rule_type, applies_to_modes,
+             applies_to_charges, rule_params, priority, effective_date,
+             expiry_date, notes, created_by)
+        VALUES
+            (CAST(:customer_party_id AS uuid), :rule_name, :rule_type,
+             :applies_to_modes, :applies_to_charges,
+             CAST(:rule_params AS jsonb), :priority,
+             :effective_date, :expiry_date, :notes, :created_by)
+        RETURNING *
+    """), {
+        "customer_party_id": payload.customer_party_id,
+        "rule_name":         payload.rule_name,
+        "rule_type":         payload.rule_type,
+        "applies_to_modes":  payload.applies_to_modes,
+        "applies_to_charges":payload.applies_to_charges,
+        "rule_params":       _json.dumps(payload.rule_params),
+        "priority":          payload.priority,
+        "effective_date":    eff,
+        "expiry_date":       exp,
+        "notes":             payload.notes,
+        "created_by":        current_user.get("email", "system"),
+    })
+    await db.commit()
+    return dict(result.mappings().one())
+
+
+@router.patch("/billing-rules/{rule_id}")
+async def update_billing_rule(
+    rule_id: str,
+    payload: BillingRuleUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(400, "No fields to update.")
+    set_parts = []
+    params: dict[str, Any] = {"id": rule_id}
+    for k, v in updates.items():
+        if k == "rule_params":
+            set_parts.append("rule_params = CAST(:rule_params AS jsonb)")
+            params["rule_params"] = _json.dumps(v)
+        elif k in ("effective_date","expiry_date") and v:
+            from datetime import date as _date
+            set_parts.append(f"{k} = :{k}")
+            params[k] = _date.fromisoformat(v)
+        else:
+            set_parts.append(f"{k} = :{k}")
+            params[k] = v
+    result = await db.execute(
+        text(f"UPDATE tms.client_billing_rules SET {', '.join(set_parts)}, updated_at=NOW() WHERE rule_id=CAST(:id AS uuid) RETURNING *"),
+        params
+    )
+    await db.commit()
+    row = result.mappings().one_or_none()
+    if not row:
+        raise HTTPException(404, "Billing rule not found.")
+    return dict(row)
+
+
+@router.delete("/billing-rules/{rule_id}", status_code=204)
+async def delete_billing_rule(
+    rule_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    await db.execute(text("DELETE FROM tms.client_billing_rules WHERE rule_id=CAST(:id AS uuid)"), {"id": rule_id})
+    await db.commit()
+
+
+# ── Apply billing rules to a shipment ────────────────────────────
+
+@router.post("/client-charges/apply-rules", status_code=201)
+async def apply_billing_rules(
+    payload: ApplyBillingRulesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-011: Apply stored billing rules for a customer to a shipment.
+    Rules are evaluated in priority order and produce client charge lines.
+    """
+    from datetime import date as _date
+    user_id  = current_user.get("email", "system")
+    as_of    = _date.fromisoformat(payload.as_of_date) if payload.as_of_date else _date.today()
+
+    # Load carrier costs
+    costs_result = await db.execute(text("""
+        SELECT * FROM tms.shipment_costs
+        WHERE shipment_id = CAST(:id AS uuid)
+        ORDER BY charge_type, charge_code
+    """), {"id": payload.shipment_id})
+    carrier_costs = [dict(r) for r in costs_result.mappings().all()]
+
+    if not carrier_costs:
+        raise HTTPException(422, "No carrier costs found. Rate the shipment first.")
+
+    # Load active billing rules for this customer + mode
+    rules_result = await db.execute(text("""
+        SELECT * FROM tms.client_billing_rules
+        WHERE customer_party_id = CAST(:cid AS uuid)
+          AND is_active = TRUE
+          AND effective_date <= :as_of
+          AND (expiry_date IS NULL OR expiry_date >= :as_of)
+          AND (:mode = ANY(applies_to_modes))
+        ORDER BY priority
+    """), {"cid": payload.customer_party_id, "as_of": as_of, "mode": payload.mode})
+    rules = [dict(r) for r in rules_result.mappings().all()]
+
+    if not rules:
+        raise HTTPException(422, f"No active billing rules found for this customer and mode {payload.mode}.")
+
+    # Clear existing client charges
+    if payload.replace_existing:
+        await db.execute(text("DELETE FROM tms.client_charges WHERE shipment_id = CAST(:id AS uuid)"), {"id": payload.shipment_id})
+
+    client_lines = []
+    carrier_total = sum(Decimal(str(c["amount"])) for c in carrier_costs)
+
+    # Track which costs have been billed
+    billed_costs: set = set()
+
+    for rule in rules:
+        params_j = rule["rule_params"] if isinstance(rule["rule_params"], dict) else {}
+        applies_charges = rule["applies_to_charges"]  # list of charge types or ['all']
+
+        def charge_matches(cost: dict) -> bool:
+            if "all" in applies_charges:
+                return True
+            return cost["charge_type"] in applies_charges or cost["charge_code"] in applies_charges
+
+        applicable_costs = [c for c in carrier_costs if charge_matches(c)]
+
+        if rule["rule_type"] == "markup":
+            mtype  = params_j.get("markup_type", "percentage")
+            mvalue = Decimal(str(params_j.get("markup_value", 0)))
+            for cost in applicable_costs:
+                carrier_amount = Decimal(str(cost["amount"]))
+                if mtype == "percentage":
+                    markup = (carrier_amount * mvalue / 100).quantize(Decimal("0.01"))
+                elif mtype == "fixed":
+                    markup = mvalue
+                else:
+                    markup = Decimal("0")
+                client_amount = carrier_amount + markup
+                client_lines.append(("markup", cost, client_amount, markup, mtype, float(mvalue)))
+                billed_costs.add(str(cost["cost_id"]))
+
+        elif rule["rule_type"] == "pass_through":
+            for cost in applicable_costs:
+                client_amount = Decimal(str(cost["amount"]))
+                client_lines.append(("pass_through", cost, client_amount, Decimal("0"), "none", 0.0))
+                billed_costs.add(str(cost["cost_id"]))
+
+        elif rule["rule_type"] == "management_fee":
+            fee_type  = params_j.get("fee_type", "percentage")
+            fee_value = Decimal(str(params_j.get("fee_value", 0)))
+            basis     = params_j.get("basis", "carrier_total")
+            desc      = params_j.get("description", "Management Fee")
+            basis_amt = carrier_total if basis == "carrier_total" else Decimal(str(sum(Decimal(str(c["amount"])) for c in applicable_costs)))
+            if fee_type == "percentage":
+                fee_amount = (basis_amt * fee_value / 100).quantize(Decimal("0.01"))
+            else:
+                fee_amount = fee_value
+            # Add as a standalone line
+            synthetic_cost = {"cost_id": None, "charge_code": "MGMT_FEE", "charge_type": "management_fee",
+                               "description": desc, "amount": 0, "calculation_basis": fee_type}
+            client_lines.append(("management_fee", synthetic_cost, fee_amount, fee_amount, fee_type, float(fee_value)))
+
+        elif rule["rule_type"] == "fixed_fee":
+            fee_amount = Decimal(str(params_j.get("amount", 0)))
+            desc       = params_j.get("description", "Fixed Fee")
+            synthetic_cost = {"cost_id": None, "charge_code": "FIXED_FEE", "charge_type": "fixed_fee",
+                               "description": desc, "amount": 0, "calculation_basis": "flat"}
+            client_lines.append(("fixed_fee", synthetic_cost, fee_amount, fee_amount, "fixed", float(fee_amount)))
+
+        elif rule["rule_type"] == "fsc_billing":
+            billing_method = params_j.get("billing_method", "pass_through")
+            fsc_costs = [c for c in carrier_costs if c["charge_type"] == "fuel_surcharge"]
+            markup_pct = Decimal(str(params_j.get("markup_pct", 0)))
+            for cost in fsc_costs:
+                carrier_amount = Decimal(str(cost["amount"]))
+                markup = (carrier_amount * markup_pct / 100).quantize(Decimal("0.01")) if billing_method == "markup" else Decimal("0")
+                client_amount = carrier_amount + markup
+                client_lines.append(("fsc_billing", cost, client_amount, markup, "percentage", float(markup_pct)))
+                billed_costs.add(str(cost["cost_id"]))
+
+    # Apply minimum billing check
+    total_client = sum(line[2] for line in client_lines)
+    min_rule = next((r for r in rules if r["rule_type"] == "minimum_billing"), None)
+    if min_rule:
+        min_amount = Decimal(str(min_rule["rule_params"].get("minimum_amount", 0)))
+        if total_client < min_amount:
+            adj = min_amount - total_client
+            synthetic_cost = {"cost_id": None, "charge_code": "MIN_CHARGE", "charge_type": "minimum_billing",
+                               "description": "Minimum Billing Adjustment", "amount": 0, "calculation_basis": "flat"}
+            client_lines.append(("minimum_billing", synthetic_cost, adj, adj, "fixed", float(min_amount)))
+            total_client = min_amount
+
+    # Persist client charges
+    saved_lines = []
+    for rule_type_applied, cost, client_amount, markup_amount, markup_type, markup_value in client_lines:
+        result = await db.execute(text("""
+            INSERT INTO tms.client_charges
+                (shipment_id, carrier_cost_id, charge_code, charge_type, description,
+                 calculation_basis, quantity, rate_amount, amount, currency,
+                 markup_type, markup_value, markup_amount, created_by)
+            VALUES
+                (CAST(:shipment_id AS uuid), CAST(:carrier_cost_id AS uuid),
+                 :charge_code, :charge_type, :description,
+                 :calculation_basis, :quantity, :rate_amount, :amount, 'USD',
+                 :markup_type, :markup_value, :markup_amount, :created_by)
+            RETURNING client_charge_id
+        """), {
+            "shipment_id":     payload.shipment_id,
+            "carrier_cost_id": str(cost["cost_id"]) if cost.get("cost_id") else None,
+            "charge_code":     cost["charge_code"],
+            "charge_type":     cost["charge_type"],
+            "description":     cost.get("description") or cost["charge_type"],
+            "calculation_basis":cost.get("calculation_basis") or cost["charge_type"],
+            "quantity":        float(cost["amount"]) if cost.get("amount") else None,
+            "rate_amount":     float(client_amount),
+            "amount":          float(client_amount),
+            "markup_type":     markup_type,
+            "markup_value":    markup_value,
+            "markup_amount":   float(markup_amount),
+            "created_by":      user_id,
+        })
+        saved_lines.append({
+            "client_charge_id":  str(result.scalar()),
+            "rule_type":         rule_type_applied,
+            "charge_code":       cost["charge_code"],
+            "charge_type":       cost["charge_type"],
+            "description":       cost.get("description"),
+            "carrier_amount":    float(cost["amount"]) if cost.get("amount") else 0,
+            "markup_type":       markup_type,
+            "markup_value":      markup_value,
+            "markup_amount":     float(markup_amount),
+            "client_amount":     float(client_amount),
+            "currency":          "USD",
+        })
+
+    await db.commit()
+
+    sell_total   = sum(l["client_amount"] for l in saved_lines)
+    buy_total    = float(carrier_total)
+    margin       = sell_total - buy_total
+    margin_pct   = (margin / buy_total * 100) if buy_total > 0 else 0
+    rules_applied = list({l["rule_type"] for l in saved_lines})
+
+    return {
+        "shipment_id":      payload.shipment_id,
+        "customer_party_id":payload.customer_party_id,
+        "rules_applied":    rules_applied,
+        "lines":            saved_lines,
+        "summary": {
+            "carrier_total": round(buy_total, 2),
+            "client_total":  round(sell_total, 2),
+            "margin":        round(margin, 2),
+            "margin_pct":    round(margin_pct, 2),
+            "line_count":    len(saved_lines),
+            "currency":      "USD",
+        },
+    }
