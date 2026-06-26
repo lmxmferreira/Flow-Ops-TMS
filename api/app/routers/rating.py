@@ -797,17 +797,23 @@ async def rate_shipment(
     # 1. Load shipment
     shp_result = await db.execute(text("""
         SELECT
-            s.shipment_id, s.carrier_id, s.mode, s.status,
-            s.total_weight_kg, s.total_weight_lb,
-            s.total_pallets, s.total_cartons, s.total_pieces,
-            s.distance_km, s.distance_miles,
-            COALESCE(s.declared_value, 0) AS declared_value,
-            o.country_code   AS origin_country,
-            o.state_province AS origin_state,
-            o.postal_code    AS origin_zip,
-            d.country_code   AS dest_country,
-            d.state_province AS dest_state,
-            d.postal_code    AS dest_zip,
+            s.shipment_id, s.carrier_id,
+            NULL::text              AS mode,
+            NULL::text              AS status,
+            s.total_weight          AS total_weight_kg,
+            s.total_weight          AS total_weight_lb,
+            s.pallet_count          AS total_pallets,
+            s.carton_count          AS total_cartons,
+            NULL::numeric           AS total_pieces,
+            s.distance_value        AS distance_km,
+            s.distance_value        AS distance_miles,
+            0                       AS declared_value,
+            NULL::text              AS origin_country,
+            o.state_province        AS origin_state,
+            o.postal_code           AS origin_zip,
+            NULL::text              AS dest_country,
+            d.state_province        AS dest_state,
+            d.postal_code           AS dest_zip,
             (SELECT COUNT(*) FROM tms.shipment_stops ss WHERE ss.shipment_id = s.shipment_id) AS stop_count
         FROM tms.shipments s
         LEFT JOIN tms.locations o ON o.location_id = s.origin_location_id
@@ -2838,3 +2844,229 @@ async def get_rate_card_audit(
         ORDER BY changed_at DESC
     """), {"id": card_id})
     return [dict(r) for r in result.mappings().all()]
+
+# ================================================================== #
+# TMS-RATE-009: Detailed Rating Breakdown
+# Append this to the end of rating.py
+# ================================================================== #
+
+class TaxInput(BaseModel):
+    charge_code: str
+    tax_rate: float    # percentage e.g. 8.5 = 8.5%
+
+class ApplyTaxRequest(BaseModel):
+    shipment_id: str
+    taxes: list[TaxInput]
+
+
+@router.get("/shipment-costs/{shipment_id}/breakdown")
+async def get_rating_breakdown(
+    shipment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-009: Return detailed rating breakdown for a shipment.
+    Includes charge code, source rate, calculation basis, quantity,
+    rate, amount, currency, and tax amount for each cost line.
+    """
+    # Load shipment header
+    shp_result = await db.execute(text("""
+        SELECT
+            s.shipment_id, s.shipment_number,
+            s.total_weight, s.pallet_count, s.carton_count, s.unit_count,
+            s.distance_value,
+            p_carrier.party_name AS carrier_name,
+            o.city AS origin_city, o.state_province AS origin_state,
+            d.city AS dest_city, d.state_province AS dest_state
+        FROM tms.shipments s
+        LEFT JOIN tms.carriers  c          ON c.carrier_id    = s.carrier_id
+        LEFT JOIN tms.parties   p_carrier  ON p_carrier.party_id = c.party_id
+        LEFT JOIN tms.locations o          ON o.location_id   = s.origin_location_id
+        LEFT JOIN tms.locations d          ON d.location_id   = s.destination_location_id
+        WHERE s.shipment_id = CAST(:id AS uuid)
+    """), {"id": shipment_id})
+    shp = shp_result.mappings().one_or_none()
+    if not shp:
+        raise HTTPException(404, "Shipment not found.")
+    shp = dict(shp)
+
+    # Load cost lines with full detail
+    costs_result = await db.execute(text("""
+        SELECT
+            sc.cost_id,
+            sc.charge_code,
+            sc.charge_type,
+            sc.description,
+            sc.calculation_basis,
+            sc.quantity,
+            sc.rate_amount,
+            sc.amount,
+            sc.tax_rate,
+            sc.tax_amount,
+            sc.currency,
+            sc.is_override,
+            sc.override_reason,
+            sc.rated_at,
+            sc.rated_by,
+            sc.updated_at,
+            sc.fsc_fuel_price,
+            sc.fsc_base_price,
+            sc.fsc_index_code,
+            rc.name          AS rate_card_name,
+            rc.rate_type     AS rate_card_type,
+            rc.version_number AS rate_card_version,
+            rc.effective_date AS rate_card_effective,
+            rc.contract_reference,
+            l.lane_name,
+            l.origin_type,
+            l.origin_value,
+            l.destination_type,
+            l.destination_value
+        FROM tms.shipment_costs sc
+        LEFT JOIN tms.carrier_rate_cards rc ON rc.rate_card_id = sc.rate_card_id
+        LEFT JOIN tms.carrier_rate_lanes l  ON l.lane_id       = sc.lane_id
+        WHERE sc.shipment_id = CAST(:id AS uuid)
+        ORDER BY
+            CASE sc.charge_type
+                WHEN 'base_flat'    THEN 1
+                WHEN 'per_mile'     THEN 2
+                WHEN 'per_km'       THEN 2
+                WHEN 'per_lb'       THEN 3
+                WHEN 'per_kg'       THEN 3
+                WHEN 'per_cwt'      THEN 3
+                WHEN 'per_pallet'   THEN 4
+                WHEN 'per_carton'   THEN 4
+                WHEN 'per_unit'     THEN 4
+                WHEN 'per_stop'     THEN 5
+                WHEN 'minimum'      THEN 8
+                WHEN 'maximum'      THEN 9
+                WHEN 'fuel_surcharge' THEN 10
+                WHEN 'accessorial'  THEN 11
+                ELSE 6
+            END,
+            sc.charge_code
+    """), {"id": shipment_id})
+    costs = [dict(r) for r in costs_result.mappings().all()]
+
+    if not costs:
+        return {
+            "shipment_id":    shipment_id,
+            "shipment_number":shp.get("shipment_number"),
+            "breakdown":      [],
+            "summary":        {"total_charges": 0, "total_tax": 0, "grand_total": 0, "currency": "USD"},
+        }
+
+    # Group by charge category
+    linehaul   = [c for c in costs if c["charge_type"] not in ("fuel_surcharge","accessorial")]
+    fsc        = [c for c in costs if c["charge_type"] == "fuel_surcharge"]
+    accessorials = [c for c in costs if c["charge_type"] == "accessorial"]
+
+    def fmt_line(c: dict) -> dict:
+        return {
+            "cost_id":          str(c["cost_id"]),
+            "charge_code":      c["charge_code"],
+            "charge_type":      c["charge_type"],
+            "description":      c["description"],
+            # Source rate info
+            "source_rate_card": c.get("rate_card_name"),
+            "rate_card_type":   c.get("rate_card_type"),
+            "rate_card_version":c.get("rate_card_version"),
+            "rate_effective":   str(c["rate_card_effective"]) if c.get("rate_card_effective") else None,
+            "contract_ref":     c.get("contract_reference"),
+            "lane":             c.get("lane_name"),
+            # Calculation detail
+            "calculation_basis":c.get("calculation_basis") or c.get("charge_type"),
+            "quantity":         float(c["quantity"]) if c.get("quantity") is not None else None,
+            "rate_amount":      float(c["rate_amount"]) if c.get("rate_amount") is not None else None,
+            # Amounts
+            "amount":           float(c["amount"]),
+            "tax_rate":         float(c["tax_rate"] or 0),
+            "tax_amount":       float(c["tax_amount"] or 0),
+            "total_with_tax":   float(c["amount"]) + float(c["tax_amount"] or 0),
+            "currency":         c["currency"] or "USD",
+            # Override info
+            "is_override":      c["is_override"],
+            "override_reason":  c.get("override_reason"),
+            # FSC detail
+            "fsc_fuel_price":   float(c["fsc_fuel_price"]) if c.get("fsc_fuel_price") else None,
+            "fsc_base_price":   float(c["fsc_base_price"]) if c.get("fsc_base_price") else None,
+            "fsc_index_code":   c.get("fsc_index_code"),
+            # Audit
+            "rated_at":         str(c["rated_at"]) if c.get("rated_at") else None,
+            "rated_by":         c.get("rated_by"),
+        }
+
+    linehaul_total   = sum(float(c["amount"]) for c in linehaul)
+    fsc_total        = sum(float(c["amount"]) for c in fsc)
+    accessorial_total= sum(float(c["amount"]) for c in accessorials)
+    total_charges    = linehaul_total + fsc_total + accessorial_total
+    total_tax        = sum(float(c.get("tax_amount") or 0) for c in costs)
+    grand_total      = total_charges + total_tax
+
+    return {
+        "shipment_id":     shipment_id,
+        "shipment_number": shp.get("shipment_number"),
+        "mode":            None,
+        "carrier":         shp.get("carrier_name"),
+        "origin":          ", ".join(filter(None, [shp.get("origin_city"), shp.get("origin_state")])),
+        "destination":     ", ".join(filter(None, [shp.get("dest_city"), shp.get("dest_state")])),
+        "weight_kg":       float(shp["total_weight"]) if shp.get("total_weight") else None,
+        "distance_km":     float(shp["distance_value"]) if shp.get("distance_value") else None,
+        "breakdown": {
+            "linehaul":    [fmt_line(c) for c in linehaul],
+            "fuel_surcharge": [fmt_line(c) for c in fsc],
+            "accessorials":[fmt_line(c) for c in accessorials],
+        },
+        "all_lines": [fmt_line(c) for c in costs],
+        "summary": {
+            "linehaul_total":    round(linehaul_total, 2),
+            "fsc_total":         round(fsc_total, 2),
+            "accessorial_total": round(accessorial_total, 2),
+            "total_charges":     round(total_charges, 2),
+            "total_tax":         round(total_tax, 2),
+            "grand_total":       round(grand_total, 2),
+            "currency":          costs[0]["currency"] if costs else "USD",
+            "line_count":        len(costs),
+            "has_overrides":     any(c["is_override"] for c in costs),
+        },
+    }
+
+
+@router.post("/shipment-costs/{shipment_id}/apply-tax")
+async def apply_tax_to_costs(
+    shipment_id: str,
+    payload: ApplyTaxRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Apply tax rates to specific charge codes on a shipment's costs.
+    Updates tax_rate and tax_amount on matching cost lines.
+    """
+    updated = []
+    for tax in payload.taxes:
+        result = await db.execute(text("""
+            UPDATE tms.shipment_costs
+            SET tax_rate   = :tax_rate,
+                tax_amount = ROUND(amount * :tax_rate / 100, 4),
+                updated_at = NOW()
+            WHERE shipment_id = CAST(:shipment_id AS uuid)
+              AND charge_code = :charge_code
+            RETURNING cost_id, charge_code, amount, tax_rate, tax_amount
+        """), {
+            "shipment_id": shipment_id,
+            "charge_code": tax.charge_code,
+            "tax_rate":    tax.tax_rate,
+        })
+        rows = [dict(r) for r in result.mappings().all()]
+        updated.extend(rows)
+
+    await db.commit()
+    total_tax = sum(float(r["tax_amount"]) for r in updated)
+    return {
+        "shipment_id": shipment_id,
+        "lines_updated": len(updated),
+        "updated": updated,
+        "total_tax_applied": round(total_tax, 2),
+    }
