@@ -3070,3 +3070,343 @@ async def apply_tax_to_costs(
         "updated": updated,
         "total_tax_applied": round(total_tax, 2),
     }
+
+# ================================================================== #
+# TMS-RATE-010: Client Charges (Sell Side) vs Carrier Costs (Buy Side)
+# Append this to the end of rating.py
+# ================================================================== #
+
+class ClientChargeLineInput(BaseModel):
+    charge_code: str
+    charge_type: str
+    description: Optional[str] = None
+    calculation_basis: Optional[str] = None
+    quantity: Optional[float] = None
+    rate_amount: float
+    currency: str = "USD"
+    markup_type: str = "none"   # none | fixed | percentage
+    markup_value: float = 0.0
+    carrier_cost_id: Optional[str] = None
+    tax_rate: float = 0.0
+
+class ClientChargesFromCarrierRequest(BaseModel):
+    """Generate client charges from carrier costs with markup rules."""
+    shipment_id: str
+    markup_type: str = "percentage"   # none | fixed | percentage
+    markup_value: float = 15.0        # default 15% margin
+    # Per-charge-type overrides
+    markup_overrides: Optional[dict] = None
+    # e.g. {"fuel_surcharge": {"markup_type": "percentage", "markup_value": 0}}
+    currency: str = "USD"
+    tax_rate: float = 0.0
+    replace_existing: bool = True
+
+class ManualClientChargesRequest(BaseModel):
+    shipment_id: str
+    charges: list[ClientChargeLineInput]
+    replace_existing: bool = False
+
+
+@router.post("/client-charges/from-carrier", status_code=201)
+async def create_client_charges_from_carrier(
+    payload: ClientChargesFromCarrierRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-010: Generate client charges by applying markup to carrier costs.
+    Each carrier cost line becomes a client charge line with the markup applied.
+    """
+    user_id = current_user.get("email", "system")
+
+    # Load carrier costs
+    costs_result = await db.execute(text("""
+        SELECT * FROM tms.shipment_costs
+        WHERE shipment_id = CAST(:id AS uuid)
+        ORDER BY charge_type, charge_code
+    """), {"id": payload.shipment_id})
+    carrier_costs = costs_result.mappings().all()
+
+    if not carrier_costs:
+        raise HTTPException(422, "No carrier costs found for this shipment. Rate the shipment first.")
+
+    # Clear existing client charges if requested
+    if payload.replace_existing:
+        await db.execute(text("""
+            DELETE FROM tms.client_charges
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": payload.shipment_id})
+
+    lines = []
+    for cost in carrier_costs:
+        cost = dict(cost)
+        carrier_amount = Decimal(str(cost["amount"]))
+
+        # Get markup for this charge type
+        override = (payload.markup_overrides or {}).get(cost["charge_type"])
+        if override:
+            mtype  = override.get("markup_type",  payload.markup_type)
+            mvalue = Decimal(str(override.get("markup_value", payload.markup_value)))
+        else:
+            mtype  = payload.markup_type
+            mvalue = Decimal(str(payload.markup_value))
+
+        # Calculate markup amount
+        if mtype == "percentage":
+            markup_amount = (carrier_amount * mvalue / Decimal("100")).quantize(Decimal("0.01"))
+        elif mtype == "fixed":
+            markup_amount = mvalue
+        else:
+            markup_amount = Decimal("0")
+
+        client_amount = carrier_amount + markup_amount
+
+        # Calculate tax
+        tax_rate   = Decimal(str(payload.tax_rate))
+        tax_amount = (client_amount * tax_rate / Decimal("100")).quantize(Decimal("0.01"))
+
+        result = await db.execute(text("""
+            INSERT INTO tms.client_charges
+                (shipment_id, carrier_cost_id, charge_code, charge_type, description,
+                 calculation_basis, quantity, rate_amount, amount, currency,
+                 markup_type, markup_value, markup_amount,
+                 tax_rate, tax_amount, created_by)
+            VALUES
+                (CAST(:shipment_id AS uuid), CAST(:carrier_cost_id AS uuid),
+                 :charge_code, :charge_type, :description,
+                 :calculation_basis, :quantity, :rate_amount, :amount, :currency,
+                 :markup_type, :markup_value, :markup_amount,
+                 :tax_rate, :tax_amount, :created_by)
+            RETURNING client_charge_id
+        """), {
+            "shipment_id":      payload.shipment_id,
+            "carrier_cost_id":  str(cost["cost_id"]),
+            "charge_code":      cost["charge_code"],
+            "charge_type":      cost["charge_type"],
+            "description":      cost["description"],
+            "calculation_basis":cost.get("calculation_basis") or cost["charge_type"],
+            "quantity":         float(cost["quantity"]) if cost.get("quantity") else None,
+            "rate_amount":      float(client_amount),
+            "amount":           float(client_amount),
+            "currency":         payload.currency,
+            "markup_type":      mtype,
+            "markup_value":     float(mvalue),
+            "markup_amount":    float(markup_amount),
+            "tax_rate":         float(tax_rate),
+            "tax_amount":       float(tax_amount),
+            "created_by":       user_id,
+        })
+        charge_id = result.scalar()
+
+        lines.append({
+            "client_charge_id":  str(charge_id),
+            "charge_code":       cost["charge_code"],
+            "charge_type":       cost["charge_type"],
+            "description":       cost["description"],
+            "carrier_amount":    float(carrier_amount),
+            "markup_type":       mtype,
+            "markup_value":      float(mvalue),
+            "markup_amount":     float(markup_amount),
+            "client_amount":     float(client_amount),
+            "tax_rate":          float(tax_rate),
+            "tax_amount":        float(tax_amount),
+            "total_with_tax":    float(client_amount + tax_amount),
+            "currency":          payload.currency,
+        })
+
+    await db.commit()
+
+    carrier_total = sum(float(c["amount"]) for c in carrier_costs)
+    client_total  = sum(l["client_amount"] for l in lines)
+    margin        = client_total - carrier_total
+    margin_pct    = (margin / carrier_total * 100) if carrier_total > 0 else 0
+
+    return {
+        "shipment_id":   payload.shipment_id,
+        "lines":         lines,
+        "summary": {
+            "carrier_total":  round(carrier_total, 2),
+            "client_total":   round(client_total, 2),
+            "total_markup":   round(margin, 2),
+            "margin_pct":     round(margin_pct, 2),
+            "total_tax":      round(sum(l["tax_amount"] for l in lines), 2),
+            "grand_total":    round(sum(l["total_with_tax"] for l in lines), 2),
+            "currency":       payload.currency,
+            "line_count":     len(lines),
+        },
+    }
+
+
+@router.post("/client-charges/manual", status_code=201)
+async def create_manual_client_charges(
+    payload: ManualClientChargesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create client charges manually (not derived from carrier costs)."""
+    user_id = current_user.get("email", "system")
+
+    if payload.replace_existing:
+        await db.execute(text("""
+            DELETE FROM tms.client_charges WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": payload.shipment_id})
+
+    lines = []
+    for ch in payload.charges:
+        amount     = Decimal(str(ch.rate_amount)) * Decimal(str(ch.quantity or 1))
+        mvalue     = Decimal(str(ch.markup_value))
+        if ch.markup_type == "percentage":
+            markup = (amount * mvalue / Decimal("100")).quantize(Decimal("0.01"))
+        elif ch.markup_type == "fixed":
+            markup = mvalue
+        else:
+            markup = Decimal("0")
+        client_amount = amount + markup
+        tax_amount    = (client_amount * Decimal(str(ch.tax_rate)) / Decimal("100")).quantize(Decimal("0.01"))
+
+        result = await db.execute(text("""
+            INSERT INTO tms.client_charges
+                (shipment_id, charge_code, charge_type, description,
+                 calculation_basis, quantity, rate_amount, amount, currency,
+                 markup_type, markup_value, markup_amount,
+                 tax_rate, tax_amount, created_by)
+            VALUES
+                (CAST(:shipment_id AS uuid), :charge_code, :charge_type, :description,
+                 :calculation_basis, :quantity, :rate_amount, :amount, :currency,
+                 :markup_type, :markup_value, :markup_amount,
+                 :tax_rate, :tax_amount, :created_by)
+            RETURNING client_charge_id
+        """), {
+            "shipment_id":      payload.shipment_id,
+            "charge_code":      ch.charge_code,
+            "charge_type":      ch.charge_type,
+            "description":      ch.description or ch.charge_type,
+            "calculation_basis":ch.calculation_basis or ch.charge_type,
+            "quantity":         ch.quantity,
+            "rate_amount":      float(Decimal(str(ch.rate_amount))),
+            "amount":           float(client_amount),
+            "currency":         ch.currency,
+            "markup_type":      ch.markup_type,
+            "markup_value":     float(mvalue),
+            "markup_amount":    float(markup),
+            "tax_rate":         ch.tax_rate,
+            "tax_amount":       float(tax_amount),
+            "created_by":       user_id,
+        })
+        lines.append({"client_charge_id": str(result.scalar()), **ch.model_dump(), "amount": float(client_amount)})
+
+    await db.commit()
+    return {"shipment_id": payload.shipment_id, "lines": lines, "line_count": len(lines)}
+
+
+@router.get("/client-charges/{shipment_id}")
+async def get_client_charges(
+    shipment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get all client charges for a shipment."""
+    result = await db.execute(text("""
+        SELECT cc.*, sc.amount AS carrier_amount, sc.charge_code AS carrier_charge_code
+        FROM tms.client_charges cc
+        LEFT JOIN tms.shipment_costs sc ON sc.cost_id = cc.carrier_cost_id
+        WHERE cc.shipment_id = CAST(:id AS uuid)
+        ORDER BY cc.charge_type, cc.charge_code
+    """), {"id": shipment_id})
+    rows = [dict(r) for r in result.mappings().all()]
+    total = sum(float(r["amount"]) for r in rows)
+    tax   = sum(float(r["tax_amount"]) for r in rows)
+    return {
+        "shipment_id": shipment_id,
+        "charges":     rows,
+        "summary": {
+            "total_charges": round(total, 2),
+            "total_tax":     round(tax, 2),
+            "grand_total":   round(total + tax, 2),
+            "currency":      rows[0]["currency"] if rows else "USD",
+            "line_count":    len(rows),
+            "billed_count":  sum(1 for r in rows if r["billed_flag"]),
+        },
+    }
+
+
+@router.get("/client-charges/{shipment_id}/margin")
+async def get_shipment_margin(
+    shipment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-010: Buy vs Sell margin analysis for a shipment.
+    Shows carrier costs (buy side) vs client charges (sell side) with margin breakdown.
+    """
+    # Carrier costs (buy side)
+    carrier_result = await db.execute(text("""
+        SELECT charge_code, charge_type, description, amount, currency
+        FROM tms.shipment_costs
+        WHERE shipment_id = CAST(:id AS uuid)
+        ORDER BY charge_type, charge_code
+    """), {"id": shipment_id})
+    carrier_costs = [dict(r) for r in carrier_result.mappings().all()]
+
+    # Client charges (sell side)
+    client_result = await db.execute(text("""
+        SELECT charge_code, charge_type, description, amount,
+               markup_type, markup_value, markup_amount,
+               tax_amount, currency, billed_flag
+        FROM tms.client_charges
+        WHERE shipment_id = CAST(:id AS uuid)
+        ORDER BY charge_type, charge_code
+    """), {"id": shipment_id})
+    client_charges = [dict(r) for r in client_result.mappings().all()]
+
+    buy_total  = sum(float(c["amount"]) for c in carrier_costs)
+    sell_total = sum(float(c["amount"]) for c in client_charges)
+    margin     = sell_total - buy_total
+    margin_pct = (margin / buy_total * 100) if buy_total > 0 else 0
+
+    # Line-by-line comparison
+    carrier_by_code = {}
+    for c in carrier_costs:
+        key = (c["charge_code"], c["charge_type"])
+        carrier_by_code[key] = carrier_by_code.get(key, 0) + float(c["amount"])
+
+    comparison = []
+    for cc in client_charges:
+        key = (cc["charge_code"], cc["charge_type"])
+        buy = carrier_by_code.get(key, 0)
+        sell = float(cc["amount"])
+        comparison.append({
+            "charge_code":    cc["charge_code"],
+            "charge_type":    cc["charge_type"],
+            "description":    cc["description"],
+            "buy_amount":     buy,
+            "sell_amount":    sell,
+            "markup_type":    cc["markup_type"],
+            "markup_value":   float(cc["markup_value"]),
+            "markup_amount":  float(cc["markup_amount"]),
+            "line_margin":    round(sell - buy, 2),
+            "line_margin_pct":round((sell - buy) / buy * 100, 2) if buy > 0 else None,
+            "currency":       cc["currency"],
+            "billed":         cc["billed_flag"],
+        })
+
+    return {
+        "shipment_id":    shipment_id,
+        "buy_side": {
+            "total":  round(buy_total, 2),
+            "lines":  len(carrier_costs),
+            "label":  "Carrier Cost",
+        },
+        "sell_side": {
+            "total":  round(sell_total, 2),
+            "lines":  len(client_charges),
+            "label":  "Client Charge",
+        },
+        "margin": {
+            "amount":     round(margin, 2),
+            "percentage": round(margin_pct, 2),
+            "currency":   "USD",
+        },
+        "comparison": comparison,
+    }
