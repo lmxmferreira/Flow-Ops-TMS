@@ -640,10 +640,10 @@ async def _find_best_lane(
           AND rc.effective_date <= CURRENT_DATE
           AND (rc.expiry_date IS NULL OR rc.expiry_date >= CURRENT_DATE)
           AND l.is_active = TRUE
-          AND (l.min_weight_kg IS NULL OR :weight_kg IS NULL OR :weight_kg >= l.min_weight_kg)
-          AND (l.max_weight_kg IS NULL OR :weight_kg IS NULL OR :weight_kg <= l.max_weight_kg)
-          AND (l.min_distance_km IS NULL OR :distance_km IS NULL OR :distance_km >= l.min_distance_km)
-          AND (l.max_distance_km IS NULL OR :distance_km IS NULL OR :distance_km <= l.max_distance_km)
+          AND (l.min_weight_kg IS NULL OR CAST(:weight_kg AS numeric) IS NULL OR CAST(:weight_kg AS numeric) >= l.min_weight_kg)
+          AND (l.max_weight_kg IS NULL OR CAST(:weight_kg AS numeric) IS NULL OR CAST(:weight_kg AS numeric) <= l.max_weight_kg)
+          AND (l.min_distance_km IS NULL OR CAST(:distance_km AS numeric) IS NULL OR CAST(:distance_km AS numeric) >= l.min_distance_km)
+          AND (l.max_distance_km IS NULL OR CAST(:distance_km AS numeric) IS NULL OR CAST(:distance_km AS numeric) <= l.max_distance_km)
         ORDER BY l.priority DESC
         LIMIT 50
     """), {"carrier_id": carrier_id, "mode": mode, "weight_kg": weight_kg, "distance_km": distance_km})
@@ -4327,4 +4327,282 @@ async def approve_shipment_financials(
             "gross_margin_pct":          float(fin.get("gross_margin_pct") or 0),
             "variance":                  float(fin.get("variance") or 0),
         },
+    }
+
+# ================================================================== #
+# TMS-RATE-014: Re-rating Engine
+# Append this to the end of rating.py
+# ================================================================== #
+
+class RerateRequest(BaseModel):
+    trigger_reason: str = "manual"
+    # rate_change|shipment_fact_change|contract_change|tax_change|allocation_change|manual
+    changed_fields: list[str] = []
+    # Re-rating options
+    rerate_carrier_costs: bool = True
+    rerate_client_charges: bool = True
+    rerate_allocations: bool = False
+    # If re-rating client charges, use these settings
+    customer_party_id: Optional[str] = None
+    mode: Optional[str] = None
+    allocation_levels: list[str] = []
+    notes: Optional[str] = None
+
+
+@router.post("/rerate/{shipment_id}", status_code=201)
+async def rerate_shipment(
+    shipment_id: str,
+    payload: RerateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-014: Re-rate a shipment when facts, rates, or rules change.
+    Captures before/after financials, logs the rerate event, and returns
+    the delta between old and new amounts.
+    """
+    user_id = current_user.get("email", "system")
+
+    # ── 1. Capture before amounts ──────────────────────────────────
+    before_result = await db.execute(text("""
+        SELECT * FROM tms.v_shipment_financials
+        WHERE shipment_id = CAST(:id AS uuid)
+    """), {"id": shipment_id})
+    before = before_result.mappings().one_or_none()
+    prev_carrier = float(before.get("total_carrier_cost") or 0) if before else 0
+    prev_client  = float(before.get("client_billable_amount") or 0) if before else 0
+    prev_margin  = float(before.get("gross_margin") or 0) if before else 0
+
+    errors = []
+    new_carrier = prev_carrier
+    new_client  = prev_client
+
+    # ── 2. Re-rate carrier costs ───────────────────────────────────
+    if payload.rerate_carrier_costs:
+        # Load shipment to check carrier + mode
+        shp_result = await db.execute(text("""
+            SELECT carrier_id, transport_mode_id FROM tms.shipments
+            WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": shipment_id})
+        shp = shp_result.mappings().one_or_none()
+
+        if shp and shp["carrier_id"]:
+            # Clear existing non-override costs
+            await db.execute(text("""
+                DELETE FROM tms.shipment_costs
+                WHERE shipment_id = CAST(:id AS uuid) AND is_override = FALSE
+            """), {"id": shipment_id})
+
+            # Find best lane and re-rate
+            lane = await _find_best_lane(
+                db,
+                carrier_id=str(shp["carrier_id"]),
+                mode=payload.mode or "FTL",
+                origin_country=None, origin_state=None, origin_zip=None,
+                dest_country=None,   dest_state=None,   dest_zip=None,
+                weight_kg=None, distance_km=None,
+            )
+
+            if lane:
+                rl_result = await db.execute(text("""
+                    SELECT * FROM tms.carrier_rate_lines
+                    WHERE lane_id = CAST(:lane_id AS uuid) AND is_active = TRUE
+                    ORDER BY sort_order
+                """), {"lane_id": lane["lane_id"]})
+                rate_lines = rl_result.mappings().all()
+
+                linehaul_total = Decimal("0")
+                for rl in rate_lines:
+                    ct   = rl["charge_type"]
+                    rate = Decimal(str(rl["rate_amount"]))
+                    if ct in ("minimum", "maximum"): continue
+                    qty, amount = _calculate_charge(
+                        ct=ct, rate=rate,
+                        weight_kg=0, weight_lb=0, pallets=0, cartons=0, units=0,
+                        stops=1, distance_km=0, distance_mi=0, shipment_value=0,
+                        lane_name=lane["lane_name"], zone_value=None,
+                        formula_text=None, shipment_data={},
+                    )
+                    await db.execute(text("""
+                        INSERT INTO tms.shipment_costs
+                            (shipment_id, rate_card_id, lane_id, charge_code, charge_type,
+                             description, quantity, rate_amount, amount, currency, rated_by)
+                        VALUES
+                            (CAST(:shipment_id AS uuid), CAST(:rate_card_id AS uuid),
+                             CAST(:lane_id AS uuid), :charge_code, :charge_type,
+                             :description, :quantity, :rate_amount, :amount, 'USD', :rated_by)
+                    """), {
+                        "shipment_id": shipment_id,
+                        "rate_card_id": str(lane["rate_card_id"]),
+                        "lane_id":     str(lane["lane_id"]),
+                        "charge_code": rl["charge_code"],
+                        "charge_type": ct,
+                        "description": rl["description"] or ct,
+                        "quantity":    float(qty) if qty else None,
+                        "rate_amount": float(rate),
+                        "amount":      float(amount),
+                        "rated_by":    f"rerate:{user_id}",
+                    })
+                    linehaul_total += amount
+            else:
+                errors.append("No matching rate lane found — carrier costs not updated.")
+        else:
+            errors.append("Shipment has no carrier — skipping carrier cost rerate.")
+
+    # ── 3. Re-rate client charges ──────────────────────────────────
+    if payload.rerate_client_charges and payload.customer_party_id:
+        # Clear existing client charges
+        await db.execute(text("""
+            DELETE FROM tms.client_charges WHERE shipment_id = CAST(:id AS uuid)
+        """), {"id": shipment_id})
+
+        # Load billing rules and reapply
+        rules_result = await db.execute(text("""
+            SELECT * FROM tms.client_billing_rules
+            WHERE customer_party_id = CAST(:cid AS uuid)
+              AND is_active = TRUE
+              AND effective_date <= CURRENT_DATE
+              AND (expiry_date IS NULL OR expiry_date >= CURRENT_DATE)
+              AND (:mode = ANY(applies_to_modes))
+            ORDER BY priority
+        """), {"cid": payload.customer_party_id, "mode": payload.mode or "FTL"})
+        rules = rules_result.mappings().all()
+
+        if not rules:
+            errors.append("No billing rules found for customer — client charges not updated.")
+        else:
+            # Load new carrier costs
+            costs_result = await db.execute(text("""
+                SELECT * FROM tms.shipment_costs WHERE shipment_id = CAST(:id AS uuid)
+            """), {"id": shipment_id})
+            carrier_costs = [dict(r) for r in costs_result.mappings().all()]
+
+            carrier_total = sum(Decimal(str(c["amount"])) for c in carrier_costs)
+
+            for rule in rules:
+                params_j = rule["rule_params"] if isinstance(rule["rule_params"], dict) else {}
+                for cost in carrier_costs:
+                    mtype  = params_j.get("markup_type", "none")
+                    mvalue = Decimal(str(params_j.get("markup_value", 0)))
+                    carrier_amount = Decimal(str(cost["amount"]))
+                    if mtype == "percentage":
+                        markup = (carrier_amount * mvalue / 100).quantize(Decimal("0.01"))
+                    elif mtype == "fixed":
+                        markup = mvalue
+                    else:
+                        markup = Decimal("0")
+                    client_amount = carrier_amount + markup
+
+                    await db.execute(text("""
+                        INSERT INTO tms.client_charges
+                            (shipment_id, carrier_cost_id, charge_code, charge_type,
+                             description, amount, currency, markup_type, markup_value,
+                             markup_amount, created_by)
+                        VALUES
+                            (CAST(:shipment_id AS uuid), CAST(:carrier_cost_id AS uuid),
+                             :charge_code, :charge_type, :description, :amount, 'USD',
+                             :markup_type, :markup_value, :markup_amount, :created_by)
+                    """), {
+                        "shipment_id":     shipment_id,
+                        "carrier_cost_id": str(cost["cost_id"]),
+                        "charge_code":     cost["charge_code"],
+                        "charge_type":     cost["charge_type"],
+                        "description":     cost.get("description"),
+                        "amount":          float(client_amount),
+                        "markup_type":     mtype,
+                        "markup_value":    float(mvalue),
+                        "markup_amount":   float(markup),
+                        "created_by":      f"rerate:{user_id}",
+                    })
+                break  # Apply first matching rule set
+
+    await db.commit()
+
+    # ── 4. Capture after amounts ───────────────────────────────────
+    after_result = await db.execute(text("""
+        SELECT * FROM tms.v_shipment_financials
+        WHERE shipment_id = CAST(:id AS uuid)
+    """), {"id": shipment_id})
+    after = after_result.mappings().one_or_none()
+    new_carrier = float(after.get("total_carrier_cost") or 0) if after else 0
+    new_client  = float(after.get("client_billable_amount") or 0) if after else 0
+    new_margin  = float(after.get("gross_margin") or 0) if after else 0
+
+    # ── 5. Log the rerate ──────────────────────────────────────────
+    log_result = await db.execute(text("""
+        INSERT INTO tms.rerate_log
+            (shipment_id, trigger_reason, changed_fields,
+             prev_carrier_cost, prev_client_charge, prev_margin,
+             new_carrier_cost,  new_client_charge,  new_margin,
+             carrier_cost_delta, client_charge_delta, margin_delta,
+             status, triggered_by, notes)
+        VALUES
+            (CAST(:shipment_id AS uuid), :reason, :fields,
+             :prev_carrier, :prev_client, :prev_margin,
+             :new_carrier,  :new_client,  :new_margin,
+             :carrier_delta, :client_delta, :margin_delta,
+             :status, :triggered_by, :notes)
+        RETURNING rerate_id
+    """), {
+        "shipment_id":   shipment_id,
+        "reason":        payload.trigger_reason,
+        "fields":        payload.changed_fields,
+        "prev_carrier":  prev_carrier,
+        "prev_client":   prev_client,
+        "prev_margin":   prev_margin,
+        "new_carrier":   new_carrier,
+        "new_client":    new_client,
+        "new_margin":    new_margin,
+        "carrier_delta": round(new_carrier - prev_carrier, 4),
+        "client_delta":  round(new_client  - prev_client,  4),
+        "margin_delta":  round(new_margin  - prev_margin,  4),
+        "status":        "completed" if not errors else "completed_with_warnings",
+        "triggered_by":  user_id,
+        "notes":         payload.notes,
+    })
+    await db.commit()
+    rerate_id = str(log_result.scalar())
+
+    return {
+        "rerate_id":       rerate_id,
+        "shipment_id":     shipment_id,
+        "trigger_reason":  payload.trigger_reason,
+        "changed_fields":  payload.changed_fields,
+        "status":          "completed" if not errors else "completed_with_warnings",
+        "warnings":        errors,
+        "before": {
+            "carrier_cost":  prev_carrier,
+            "client_charge": prev_client,
+            "margin":        prev_margin,
+        },
+        "after": {
+            "carrier_cost":  new_carrier,
+            "client_charge": new_client,
+            "margin":        new_margin,
+        },
+        "delta": {
+            "carrier_cost":  round(new_carrier - prev_carrier, 2),
+            "client_charge": round(new_client  - prev_client,  2),
+            "margin":        round(new_margin  - prev_margin,  2),
+        },
+    }
+
+
+@router.get("/rerate/{shipment_id}/history")
+async def get_rerate_history(
+    shipment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return rerate history for a shipment."""
+    result = await db.execute(text("""
+        SELECT * FROM tms.rerate_log
+        WHERE shipment_id = CAST(:id AS uuid)
+        ORDER BY completed_at DESC
+    """), {"id": shipment_id})
+    rows = [dict(r) for r in result.mappings().all()]
+    return {
+        "shipment_id":  shipment_id,
+        "rerate_count": len(rows),
+        "history":      rows,
     }
