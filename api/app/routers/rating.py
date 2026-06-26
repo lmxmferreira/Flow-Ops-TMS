@@ -1660,3 +1660,1181 @@ async def compare_rates(
         "results":               rated + no_rates,
         "best_rate":             best_rate,
     }
+
+# ================================================================== #
+# TMS-RATE-006: Enhanced Fuel Surcharge Calculation
+# Append this to the end of rating.py
+# ================================================================== #
+
+class FuelIndexCreate(BaseModel):
+    index_code: str
+    index_name: str
+    description: Optional[str] = None
+    unit: str = "USD_PER_GALLON"
+    current_price: float
+
+class FuelIndexPriceUpdate(BaseModel):
+    current_price: float
+    source: Optional[str] = None
+
+class FuelSurchargeAdvancedCreate(BaseModel):
+    carrier_id: str
+    name: str
+    mode: Optional[str] = None
+    effective_date: str
+    expiry_date: Optional[str] = None
+    # Calculation method
+    calc_method: str = "fixed"    # fixed | index_based | sliding_scale | distance_band
+    # Fixed rate fields
+    rate_type: str = "percentage"
+    rate_value: float = 0
+    basis: str = "linehaul"
+    # Index-based fields
+    fuel_index_id: Optional[str] = None
+    base_fuel_price: Optional[float] = None
+    price_increment: Optional[float] = None   # e.g. 0.05 = per $0.05 fuel change
+    increment_rate: Optional[float] = None    # e.g. 0.5 = 0.5% FSC change per increment
+    # Distance band fields
+    distance_bands: Optional[list] = None     # [{min_km, max_km, rate}]
+    # Carrier contract overrides
+    contract_rules: Optional[dict] = None
+    notes: Optional[str] = None
+    is_active: bool = True
+
+
+# ── Fuel Index CRUD ───────────────────────────────────────────────
+
+@router.get("/fuel-indexes")
+async def list_fuel_indexes(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        SELECT fi.*,
+               (SELECT price FROM tms.fuel_index_history
+                WHERE fuel_index_id = fi.fuel_index_id
+                ORDER BY effective_date DESC LIMIT 1) AS last_reported_price,
+               (SELECT effective_date FROM tms.fuel_index_history
+                WHERE fuel_index_id = fi.fuel_index_id
+                ORDER BY effective_date DESC LIMIT 1) AS last_report_date
+        FROM tms.fuel_indexes fi
+        ORDER BY fi.index_code
+    """))
+    return [dict(r) for r in result.mappings().all()]
+
+
+@router.post("/fuel-indexes", status_code=201)
+async def create_fuel_index(
+    payload: FuelIndexCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        INSERT INTO tms.fuel_indexes
+            (index_code, index_name, description, unit, current_price, price_updated_at)
+        VALUES
+            (:index_code, :index_name, :description, :unit, :current_price, NOW())
+        RETURNING *
+    """), payload.model_dump())
+    await db.commit()
+    return dict(result.mappings().one())
+
+
+@router.patch("/fuel-indexes/{index_id}/price")
+async def update_fuel_price(
+    index_id: str,
+    payload: FuelIndexPriceUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update current fuel price and log to history."""
+    # Update current price
+    result = await db.execute(text("""
+        UPDATE tms.fuel_indexes
+        SET current_price = :price, price_updated_at = NOW(), updated_at = NOW()
+        WHERE fuel_index_id = CAST(:id AS uuid)
+        RETURNING *
+    """), {"price": payload.current_price, "id": index_id})
+    row = result.mappings().one_or_none()
+    if not row:
+        raise HTTPException(404, "Fuel index not found.")
+
+    # Log to history
+    await db.execute(text("""
+        INSERT INTO tms.fuel_index_history
+            (fuel_index_id, price, effective_date, source)
+        VALUES
+            (CAST(:id AS uuid), :price, CURRENT_DATE, :source)
+    """), {"id": index_id, "price": payload.current_price, "source": payload.source or "manual"})
+
+    await db.commit()
+    return dict(row)
+
+
+@router.get("/fuel-indexes/{index_id}/history")
+async def get_fuel_index_history(
+    index_id: str,
+    limit: int = 52,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        SELECT * FROM tms.fuel_index_history
+        WHERE fuel_index_id = CAST(:id AS uuid)
+        ORDER BY effective_date DESC
+        LIMIT :limit
+    """), {"id": index_id, "limit": limit})
+    return [dict(r) for r in result.mappings().all()]
+
+
+# ── Advanced FSC Calculation ──────────────────────────────────────
+
+@router.post("/fuel-surcharges/advanced", status_code=201)
+async def create_advanced_fuel_surcharge(
+    payload: FuelSurchargeAdvancedCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a fuel surcharge with advanced calculation method."""
+    import uuid as _uuid
+    schedule_code = f"FSC-{payload.carrier_id[:8].upper()}-{payload.mode or 'ALL'}-{payload.effective_date[:7]}-{str(_uuid.uuid4())[:4]}"
+
+    result = await db.execute(text("""
+        INSERT INTO tms.fuel_surcharge_schedules
+            (schedule_code, carrier_id, name, mode, effective_date, expiry_date,
+             rate_type, rate_value, basis, calc_method, fuel_index_id,
+             base_fuel_price, price_increment, increment_rate,
+             distance_bands, contract_rules, notes, is_active)
+        VALUES
+            (:schedule_code, CAST(:carrier_id AS uuid), :name, :mode,
+             CAST(:effective_date AS date), CAST(:expiry_date AS date),
+             :rate_type, :rate_value, :basis, :calc_method,
+             CAST(:fuel_index_id AS uuid), :base_fuel_price,
+             :price_increment, :increment_rate,
+             CAST(:distance_bands AS jsonb), CAST(:contract_rules AS jsonb),
+             :notes, :is_active)
+        RETURNING *
+    """), {
+        **payload.model_dump(),
+        "schedule_code":  schedule_code,
+        "distance_bands": json.dumps(payload.distance_bands) if payload.distance_bands else None,
+        "contract_rules": json.dumps(payload.contract_rules) if payload.contract_rules else None,
+    })
+    await db.commit()
+    return dict(result.mappings().one())
+
+
+def _calculate_fsc_amount(
+    fsc: dict,
+    linehaul_total: Decimal,
+    distance_km: float,
+    distance_mi: float,
+    current_fuel_price: Optional[float] = None,
+) -> tuple[Decimal, dict]:
+    """
+    Calculate FSC amount based on calc_method.
+    Returns (fsc_amount, metadata_dict)
+    """
+    rate     = Decimal(str(fsc.get("rate_value") or 0))
+    method   = fsc.get("calc_method") or "fixed"
+    metadata: dict = {"calc_method": method}
+
+    if method == "fixed":
+        if fsc.get("rate_type") == "percentage":
+            basis_amount = linehaul_total if fsc.get("basis") == "linehaul" else linehaul_total
+            amount = (basis_amount * rate / Decimal("100")).quantize(Decimal("0.01"))
+        elif fsc.get("rate_type") == "per_mile":
+            amount = (Decimal(str(distance_mi)) * rate).quantize(Decimal("0.01"))
+        elif fsc.get("rate_type") == "per_km":
+            amount = (Decimal(str(distance_km)) * rate).quantize(Decimal("0.01"))
+        else:
+            amount = rate
+        metadata["rate_applied"] = float(rate)
+
+    elif method == "index_based":
+        # FSC = (current_price - base_price) / increment * increment_rate
+        fuel_price = Decimal(str(current_fuel_price or fsc.get("current_price") or rate))
+        base_price = Decimal(str(fsc.get("base_fuel_price") or fuel_price))
+        increment  = Decimal(str(fsc.get("price_increment") or "0.05"))
+        inc_rate   = Decimal(str(fsc.get("increment_rate")  or "0.5"))
+
+        if increment > 0:
+            price_diff  = fuel_price - base_price
+            increments  = (price_diff / increment).quantize(Decimal("1"))
+            fsc_pct     = (inc_rate * increments).quantize(Decimal("0.01"))
+            # Minimum 0% FSC
+            fsc_pct     = max(fsc_pct, Decimal("0"))
+        else:
+            fsc_pct = rate
+
+        basis_amount = linehaul_total
+        amount = (basis_amount * fsc_pct / Decimal("100")).quantize(Decimal("0.01"))
+        metadata.update({
+            "current_fuel_price": float(fuel_price),
+            "base_fuel_price":    float(base_price),
+            "fsc_pct_applied":    float(fsc_pct),
+        })
+
+    elif method == "sliding_scale":
+        # Same as index_based but capped
+        fuel_price = Decimal(str(current_fuel_price or fsc.get("current_price") or rate))
+        base_price = Decimal(str(fsc.get("base_fuel_price") or fuel_price))
+        increment  = Decimal(str(fsc.get("price_increment") or "0.05"))
+        inc_rate   = Decimal(str(fsc.get("increment_rate")  or "0.5"))
+
+        price_diff = max(fuel_price - base_price, Decimal("0"))
+        fsc_pct    = (price_diff / increment * inc_rate).quantize(Decimal("0.01")) if increment > 0 else rate
+        amount     = (linehaul_total * fsc_pct / Decimal("100")).quantize(Decimal("0.01"))
+        metadata.update({
+            "current_fuel_price": float(fuel_price),
+            "base_fuel_price":    float(base_price),
+            "fsc_pct_applied":    float(fsc_pct),
+        })
+
+    elif method == "distance_band":
+        bands = fsc.get("distance_bands") or []
+        matched_rate = rate  # fallback
+        for band in bands:
+            min_km = band.get("min_km", 0)
+            max_km = band.get("max_km")  # None = no upper limit
+            if distance_km >= min_km and (max_km is None or distance_km < max_km):
+                matched_rate = Decimal(str(band.get("rate", 0)))
+                metadata["band_matched"] = band
+                break
+        amount = (linehaul_total * matched_rate / Decimal("100")).quantize(Decimal("0.01"))
+        metadata["rate_applied"] = float(matched_rate)
+
+    else:
+        amount = Decimal("0")
+
+    return amount, metadata
+
+
+@router.post("/calculate-fsc")
+async def calculate_fsc_preview(
+    db: AsyncSession = Depends(get_db),
+    carrier_id: str = "",
+    mode: str = "FTL",
+    linehaul_amount: float = 0,
+    distance_km: float = 0,
+    distance_miles: float = 0,
+    effective_date: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Preview FSC calculation for a carrier/mode without persisting.
+    Shows which schedule would apply and the calculated amount.
+    """
+    from datetime import date as _date
+
+    eff_date = _date.fromisoformat(effective_date) if effective_date else None
+    date_filter = "AND fsc.effective_date <= :eff_date AND (fsc.expiry_date IS NULL OR fsc.expiry_date >= :eff_date)" if eff_date else "AND fsc.effective_date <= CURRENT_DATE AND (fsc.expiry_date IS NULL OR fsc.expiry_date >= CURRENT_DATE)"
+    date_params = {"eff_date": eff_date} if eff_date else {}
+
+    result = await db.execute(text(f"""
+        SELECT fsc.*,
+               fi.index_code, fi.index_name, fi.current_price AS index_current_price
+        FROM tms.fuel_surcharge_schedules fsc
+        LEFT JOIN tms.fuel_indexes fi ON fi.fuel_index_id = fsc.fuel_index_id
+        WHERE fsc.carrier_id = CAST(:carrier_id AS uuid)
+          AND fsc.is_active = TRUE
+          {date_filter}
+          AND (fsc.mode IS NULL OR fsc.mode = :mode)
+        ORDER BY fsc.mode NULLS LAST
+        LIMIT 1
+    """), {"carrier_id": carrier_id, "mode": mode, **date_params})
+
+    fsc = result.mappings().one_or_none()
+    if not fsc:
+        return {"message": "No active fuel surcharge schedule found.", "fsc_amount": 0}
+
+    fsc_dict = dict(fsc)
+    linehaul = Decimal(str(linehaul_amount))
+    dist_mi  = distance_miles or distance_km * 0.621371
+
+    fsc_amount, meta = _calculate_fsc_amount(
+        fsc=fsc_dict,
+        linehaul_total=linehaul,
+        distance_km=distance_km,
+        distance_mi=dist_mi,
+        current_fuel_price=float(fsc_dict.get("index_current_price") or 0) or None,
+    )
+
+    return {
+        "carrier_id":       carrier_id,
+        "mode":             mode,
+        "schedule_code":    fsc_dict["schedule_code"],
+        "schedule_name":    fsc_dict["name"],
+        "calc_method":      fsc_dict.get("calc_method", "fixed"),
+        "fuel_index":       fsc_dict.get("index_code"),
+        "linehaul_amount":  linehaul_amount,
+        "fsc_amount":       float(fsc_amount),
+        "fsc_pct":          float(fsc_amount / linehaul * 100) if linehaul > 0 else 0,
+        "calculation_detail": meta,
+    }
+
+# ================================================================== #
+# TMS-RATE-006: Enhanced Fuel Surcharge Calculation
+# Append this to the end of rating.py
+# ================================================================== #
+
+class FuelIndexCreate(BaseModel):
+    index_code: str
+    index_name: str
+    description: Optional[str] = None
+    unit: str = "USD_PER_GALLON"
+    current_price: float
+
+class FuelIndexPriceUpdate(BaseModel):
+    current_price: float
+    source: Optional[str] = None
+
+class FuelSurchargeAdvancedCreate(BaseModel):
+    carrier_id: str
+    name: str
+    mode: Optional[str] = None
+    effective_date: str
+    expiry_date: Optional[str] = None
+    # Calculation method
+    calc_method: str = "fixed"    # fixed | index_based | sliding_scale | distance_band
+    # Fixed rate fields
+    rate_type: str = "percentage"
+    rate_value: float = 0
+    basis: str = "linehaul"
+    # Index-based fields
+    tms_fuel_index_id: Optional[str] = None
+    base_fuel_price: Optional[float] = None
+    price_increment: Optional[float] = None   # e.g. 0.05 = per $0.05 fuel change
+    increment_rate: Optional[float] = None    # e.g. 0.5 = 0.5% FSC change per increment
+    # Distance band fields
+    distance_bands: Optional[list] = None     # [{min_km, max_km, rate}]
+    # Carrier contract overrides
+    contract_rules: Optional[dict] = None
+    notes: Optional[str] = None
+    is_active: bool = True
+
+
+# ── Fuel Index CRUD ───────────────────────────────────────────────
+
+@router.get("/fuel-indexes")
+async def list_fuel_indexes(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        SELECT fi.*,
+               (SELECT price FROM tms.fuel_index_history
+                WHERE tms_fuel_index_id = fi.tms_fuel_index_id
+                ORDER BY effective_date DESC LIMIT 1) AS last_reported_price,
+               (SELECT effective_date FROM tms.fuel_index_history
+                WHERE tms_fuel_index_id = fi.tms_fuel_index_id
+                ORDER BY effective_date DESC LIMIT 1) AS last_report_date
+        FROM tms.fuel_indexes fi
+        ORDER BY fi.index_code
+    """))
+    return [dict(r) for r in result.mappings().all()]
+
+
+@router.post("/fuel-indexes", status_code=201)
+async def create_fuel_index(
+    payload: FuelIndexCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        INSERT INTO tms.fuel_indexes
+            (index_code, index_name, description, unit, current_price, price_updated_at)
+        VALUES
+            (:index_code, :index_name, :description, :unit, :current_price, NOW())
+        RETURNING *
+    """), payload.model_dump())
+    await db.commit()
+    return dict(result.mappings().one())
+
+
+@router.patch("/fuel-indexes/{index_id}/price")
+async def update_fuel_price(
+    index_id: str,
+    payload: FuelIndexPriceUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update current fuel price and log to history."""
+    # Update current price
+    result = await db.execute(text("""
+        UPDATE tms.fuel_indexes
+        SET current_price = :price, price_updated_at = NOW(), updated_at = NOW()
+        WHERE tms_fuel_index_id = CAST(:id AS uuid)
+        RETURNING *
+    """), {"price": payload.current_price, "id": index_id})
+    row = result.mappings().one_or_none()
+    if not row:
+        raise HTTPException(404, "Fuel index not found.")
+
+    # Log to history
+    await db.execute(text("""
+        INSERT INTO tms.fuel_index_history
+            (tms_fuel_index_id, price, effective_date, source)
+        VALUES
+            (CAST(:id AS uuid), :price, CURRENT_DATE, :source)
+    """), {"id": index_id, "price": payload.current_price, "source": payload.source or "manual"})
+
+    await db.commit()
+    return dict(row)
+
+
+@router.get("/fuel-indexes/{index_id}/history")
+async def get_fuel_index_history(
+    index_id: str,
+    limit: int = 52,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(text("""
+        SELECT * FROM tms.fuel_index_history
+        WHERE tms_fuel_index_id = CAST(:id AS uuid)
+        ORDER BY effective_date DESC
+        LIMIT :limit
+    """), {"id": index_id, "limit": limit})
+    return [dict(r) for r in result.mappings().all()]
+
+
+# ── Advanced FSC Calculation ──────────────────────────────────────
+
+@router.post("/fuel-surcharges/advanced", status_code=201)
+async def create_advanced_fuel_surcharge(
+    payload: FuelSurchargeAdvancedCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a fuel surcharge with advanced calculation method."""
+    import uuid as _uuid
+    schedule_code = f"FSC-{payload.carrier_id[:8].upper()}-{payload.mode or 'ALL'}-{payload.effective_date[:7]}-{str(_uuid.uuid4())[:4]}"
+
+    result = await db.execute(text("""
+        INSERT INTO tms.fuel_surcharge_schedules
+            (schedule_code, carrier_id, name, mode, effective_date, expiry_date,
+             rate_type, rate_value, basis, calc_method, tms_fuel_index_id,
+             base_fuel_price, price_increment, increment_rate,
+             distance_bands, contract_rules, notes, is_active)
+        VALUES
+            (:schedule_code, CAST(:carrier_id AS uuid), :name, :mode,
+             CAST(:effective_date AS date), CAST(:expiry_date AS date),
+             :rate_type, :rate_value, :basis, :calc_method,
+             CAST(:tms_fuel_index_id AS uuid), :base_fuel_price,
+             :price_increment, :increment_rate,
+             CAST(:distance_bands AS jsonb), CAST(:contract_rules AS jsonb),
+             :notes, :is_active)
+        RETURNING *
+    """), {
+        **payload.model_dump(),
+        "schedule_code":  schedule_code,
+        "distance_bands": json.dumps(payload.distance_bands) if payload.distance_bands else None,
+        "contract_rules": json.dumps(payload.contract_rules) if payload.contract_rules else None,
+    })
+    await db.commit()
+    return dict(result.mappings().one())
+
+
+def _calculate_fsc_amount(
+    fsc: dict,
+    linehaul_total: Decimal,
+    distance_km: float,
+    distance_mi: float,
+    current_fuel_price: Optional[float] = None,
+) -> tuple[Decimal, dict]:
+    """
+    Calculate FSC amount based on calc_method.
+    Returns (fsc_amount, metadata_dict)
+    """
+    rate     = Decimal(str(fsc.get("rate_value") or 0))
+    method   = fsc.get("calc_method") or "fixed"
+    metadata: dict = {"calc_method": method}
+
+    if method == "fixed":
+        if fsc.get("rate_type") == "percentage":
+            basis_amount = linehaul_total if fsc.get("basis") == "linehaul" else linehaul_total
+            amount = (basis_amount * rate / Decimal("100")).quantize(Decimal("0.01"))
+        elif fsc.get("rate_type") == "per_mile":
+            amount = (Decimal(str(distance_mi)) * rate).quantize(Decimal("0.01"))
+        elif fsc.get("rate_type") == "per_km":
+            amount = (Decimal(str(distance_km)) * rate).quantize(Decimal("0.01"))
+        else:
+            amount = rate
+        metadata["rate_applied"] = float(rate)
+
+    elif method == "index_based":
+        # FSC = (current_price - base_price) / increment * increment_rate
+        fuel_price = Decimal(str(current_fuel_price or fsc.get("current_price") or rate))
+        base_price = Decimal(str(fsc.get("base_fuel_price") or fuel_price))
+        increment  = Decimal(str(fsc.get("price_increment") or "0.05"))
+        inc_rate   = Decimal(str(fsc.get("increment_rate")  or "0.5"))
+
+        if increment > 0:
+            price_diff  = fuel_price - base_price
+            increments  = (price_diff / increment).quantize(Decimal("1"))
+            fsc_pct     = (inc_rate * increments).quantize(Decimal("0.01"))
+            # Minimum 0% FSC
+            fsc_pct     = max(fsc_pct, Decimal("0"))
+        else:
+            fsc_pct = rate
+
+        basis_amount = linehaul_total
+        amount = (basis_amount * fsc_pct / Decimal("100")).quantize(Decimal("0.01"))
+        metadata.update({
+            "current_fuel_price": float(fuel_price),
+            "base_fuel_price":    float(base_price),
+            "fsc_pct_applied":    float(fsc_pct),
+        })
+
+    elif method == "sliding_scale":
+        # Same as index_based but capped
+        fuel_price = Decimal(str(current_fuel_price or fsc.get("current_price") or rate))
+        base_price = Decimal(str(fsc.get("base_fuel_price") or fuel_price))
+        increment  = Decimal(str(fsc.get("price_increment") or "0.05"))
+        inc_rate   = Decimal(str(fsc.get("increment_rate")  or "0.5"))
+
+        price_diff = max(fuel_price - base_price, Decimal("0"))
+        fsc_pct    = (price_diff / increment * inc_rate).quantize(Decimal("0.01")) if increment > 0 else rate
+        amount     = (linehaul_total * fsc_pct / Decimal("100")).quantize(Decimal("0.01"))
+        metadata.update({
+            "current_fuel_price": float(fuel_price),
+            "base_fuel_price":    float(base_price),
+            "fsc_pct_applied":    float(fsc_pct),
+        })
+
+    elif method == "distance_band":
+        bands = fsc.get("distance_bands") or []
+        matched_rate = rate  # fallback
+        for band in bands:
+            min_km = band.get("min_km", 0)
+            max_km = band.get("max_km")  # None = no upper limit
+            if distance_km >= min_km and (max_km is None or distance_km < max_km):
+                matched_rate = Decimal(str(band.get("rate", 0)))
+                metadata["band_matched"] = band
+                break
+        amount = (linehaul_total * matched_rate / Decimal("100")).quantize(Decimal("0.01"))
+        metadata["rate_applied"] = float(matched_rate)
+
+    else:
+        amount = Decimal("0")
+
+    return amount, metadata
+
+
+@router.post("/calculate-fsc")
+async def calculate_fsc_preview(
+    db: AsyncSession = Depends(get_db),
+    carrier_id: str = "",
+    mode: str = "FTL",
+    linehaul_amount: float = 0,
+    distance_km: float = 0,
+    distance_miles: float = 0,
+    effective_date: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Preview FSC calculation for a carrier/mode without persisting.
+    Shows which schedule would apply and the calculated amount.
+    """
+    from datetime import date as _date
+
+    eff_date = _date.fromisoformat(effective_date) if effective_date else None
+    date_filter = "AND fsc.effective_date <= :eff_date AND (fsc.expiry_date IS NULL OR fsc.expiry_date >= :eff_date)" if eff_date else "AND fsc.effective_date <= CURRENT_DATE AND (fsc.expiry_date IS NULL OR fsc.expiry_date >= CURRENT_DATE)"
+    date_params = {"eff_date": eff_date} if eff_date else {}
+
+    result = await db.execute(text(f"""
+        SELECT fsc.*,
+               fi.index_code, fi.index_name, fi.current_price AS index_current_price
+        FROM tms.fuel_surcharge_schedules fsc
+        LEFT JOIN tms.fuel_indexes fi ON fi.tms_fuel_index_id = fsc.tms_fuel_index_id
+        WHERE fsc.carrier_id = CAST(:carrier_id AS uuid)
+          AND fsc.is_active = TRUE
+          {date_filter}
+          AND (fsc.mode IS NULL OR fsc.mode = :mode)
+        ORDER BY fsc.mode NULLS LAST
+        LIMIT 1
+    """), {"carrier_id": carrier_id, "mode": mode, **date_params})
+
+    fsc = result.mappings().one_or_none()
+    if not fsc:
+        return {"message": "No active fuel surcharge schedule found.", "fsc_amount": 0}
+
+    fsc_dict = dict(fsc)
+    linehaul = Decimal(str(linehaul_amount))
+    dist_mi  = distance_miles or distance_km * 0.621371
+
+    fsc_amount, meta = _calculate_fsc_amount(
+        fsc=fsc_dict,
+        linehaul_total=linehaul,
+        distance_km=distance_km,
+        distance_mi=dist_mi,
+        current_fuel_price=float(fsc_dict.get("index_current_price") or 0) or None,
+    )
+
+    return {
+        "carrier_id":       carrier_id,
+        "mode":             mode,
+        "schedule_code":    fsc_dict["schedule_code"],
+        "schedule_name":    fsc_dict["name"],
+        "calc_method":      fsc_dict.get("calc_method", "fixed"),
+        "fuel_index":       fsc_dict.get("index_code"),
+        "linehaul_amount":  linehaul_amount,
+        "fsc_amount":       float(fsc_amount),
+        "fsc_pct":          float(fsc_amount / linehaul * 100) if linehaul > 0 else 0,
+        "calculation_detail": meta,
+    }
+
+# ================================================================== #
+# TMS-RATE-007: Accessorial Charge Calculation
+# Append this to the end of rating.py
+# ================================================================== #
+
+import json as _json
+
+class AccessorialLineInput(BaseModel):
+    charge_code: str
+    quantity: Optional[float] = None   # hours, days, stops, etc.
+    override_amount: Optional[float] = None  # manual override
+    notes: Optional[str] = None
+
+class AccessorialCalculateRequest(BaseModel):
+    carrier_id: str
+    mode: str
+    shipment_id: Optional[str] = None
+    declared_value: Optional[float] = None
+    distance_km: Optional[float] = None
+    distance_miles: Optional[float] = None
+    accessorials: list[AccessorialLineInput]
+    persist: bool = False   # if True, save to shipment_costs
+
+
+@router.get("/accessorials/catalog")
+async def get_accessorial_catalog(
+    db: AsyncSession = Depends(get_db),
+    carrier_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return all active accessorial charges with calculation details."""
+    conditions = ["is_active = TRUE"]
+    params: dict[str, Any] = {}
+
+    if carrier_id:
+        conditions.append("carrier_id = CAST(:carrier_id AS uuid)")
+        params["carrier_id"] = carrier_id
+    if mode:
+        conditions.append(":mode = ANY(applies_to_modes)")
+        params["mode"] = mode
+
+    where = " AND ".join(conditions)
+    result = await db.execute(text(f"""
+        SELECT
+            accessorial_id, charge_code, description, charge_type,
+            calculation_basis, rate_amount, currency, applies_to_modes,
+            input_label, free_units, min_units, max_units,
+            calculation_notes, is_active
+        FROM tms.accessorial_charges
+        WHERE {where}
+        ORDER BY charge_code
+    """), params)
+    return [dict(r) for r in result.mappings().all()]
+
+
+@router.post("/calculate-accessorials")
+async def calculate_accessorials(
+    payload: AccessorialCalculateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-007: Calculate accessorial charges for a shipment.
+    Accepts a list of accessorial codes with quantities and returns
+    calculated amounts. Optionally persists to shipment_costs.
+    """
+    if not payload.accessorials:
+        return {"carrier_id": payload.carrier_id, "mode": payload.mode,
+                "lines": [], "total": 0.0, "currency": "USD"}
+
+    codes = [a.charge_code for a in payload.accessorials]
+
+    # Load applicable accessorial definitions
+    result = await db.execute(text("""
+        SELECT *
+        FROM tms.accessorial_charges
+        WHERE carrier_id = CAST(:carrier_id AS uuid)
+          AND charge_code = ANY(:codes)
+          AND is_active = TRUE
+    """), {"carrier_id": payload.carrier_id, "codes": codes})
+    catalog = {r["charge_code"]: dict(r) for r in result.mappings().all()}
+
+    distance_km = payload.distance_km or 0.0
+    distance_mi = payload.distance_miles or distance_km * 0.621371
+    declared_value = payload.declared_value or 0.0
+
+    lines = []
+    grand_total = Decimal("0")
+
+    for item in payload.accessorials:
+        code = item.charge_code
+        acc  = catalog.get(code)
+
+        if not acc:
+            lines.append({
+                "charge_code": code,
+                "status": "not_found",
+                "message": f"No active accessorial '{code}' found for this carrier/mode.",
+                "amount": 0.0,
+            })
+            continue
+
+        # Handle override
+        if item.override_amount is not None:
+            amount = Decimal(str(item.override_amount))
+            lines.append({
+                "charge_code":   code,
+                "description":   acc["description"],
+                "calc_basis":    acc["calculation_basis"],
+                "rate":          float(Decimal(str(acc["rate_amount"]))),
+                "quantity":      item.quantity,
+                "free_units":    float(acc["free_units"] or 0),
+                "billable_units":item.quantity,
+                "amount":        float(amount),
+                "currency":      acc["currency"],
+                "is_override":   True,
+                "notes":         item.notes,
+            })
+            grand_total += amount
+            continue
+
+        rate     = Decimal(str(acc["rate_amount"]))
+        basis    = acc["calculation_basis"]
+        free     = Decimal(str(acc["free_units"] or 0))
+        qty      = Decimal(str(item.quantity or 1))
+        amount   = Decimal("0")
+        billable = qty
+
+        if basis == "flat":
+            amount   = rate
+            billable = Decimal("1")
+
+        elif basis in ("per_hour", "per_day", "per_unit"):
+            billable = max(qty - free, Decimal("0"))
+            if acc["min_units"]:
+                billable = max(billable, Decimal(str(acc["min_units"])))
+            if acc["max_units"]:
+                billable = min(billable, Decimal(str(acc["max_units"])))
+            amount = billable * rate
+
+        elif basis == "per_mile":
+            billable = Decimal(str(distance_mi))
+            amount   = billable * rate
+
+        elif basis == "per_km":
+            billable = Decimal(str(distance_km))
+            amount   = billable * rate
+
+        elif basis == "percentage":
+            # percentage of declared value
+            if declared_value > 0:
+                amount = (Decimal(str(declared_value)) * rate / Decimal("100")).quantize(Decimal("0.01"))
+            billable = rate
+
+        elif basis == "per_cwt":
+            # assume qty is weight in lbs
+            billable = (qty / Decimal("100")).quantize(Decimal("0.01"))
+            amount   = billable * rate
+
+        lines.append({
+            "charge_code":   code,
+            "description":   acc["description"],
+            "calc_basis":    basis,
+            "rate":          float(rate),
+            "quantity":      float(qty),
+            "free_units":    float(free),
+            "billable_units":float(billable),
+            "amount":        float(amount),
+            "currency":      acc["currency"],
+            "is_override":   False,
+            "notes":         item.notes or acc.get("calculation_notes"),
+        })
+        grand_total += amount
+
+    # Optionally persist to shipment_costs
+    if payload.persist and payload.shipment_id:
+        for line in lines:
+            if line.get("status") == "not_found":
+                continue
+            await db.execute(text("""
+                INSERT INTO tms.shipment_costs
+                    (shipment_id, charge_code, charge_type, description,
+                     quantity, rate_amount, amount, currency, rated_by)
+                VALUES
+                    (CAST(:shipment_id AS uuid), :charge_code, 'accessorial',
+                     :description, :quantity, :rate_amount, :amount, :currency, 'system')
+            """), {
+                "shipment_id": payload.shipment_id,
+                "charge_code": line["charge_code"],
+                "description": line["description"],
+                "quantity":    line["billable_units"],
+                "rate_amount": line["rate"],
+                "amount":      line["amount"],
+                "currency":    line["currency"],
+            })
+        await db.commit()
+
+    return {
+        "carrier_id":   payload.carrier_id,
+        "mode":         payload.mode,
+        "shipment_id":  payload.shipment_id,
+        "lines":        lines,
+        "total":        float(grand_total),
+        "currency":     "USD",
+        "persisted":    payload.persist and payload.shipment_id is not None,
+    }
+
+# ================================================================== #
+# TMS-RATE-008: Rate Card Version Control
+# Append this to the end of rating.py
+# ================================================================== #
+
+class NewVersionRequest(BaseModel):
+    effective_date: str
+    expiry_date: Optional[str] = None
+    change_reason: Optional[str] = None
+    # Optional field overrides for new version
+    name: Optional[str] = None
+    currency: Optional[str] = None
+    rate_type: Optional[str] = None
+    notes: Optional[str] = None
+    copy_lanes: bool = True   # copy all lanes + rate lines from parent
+
+
+@router.post("/rate-cards/{card_id}/new-version", status_code=201)
+async def create_new_version(
+    card_id: str,
+    payload: NewVersionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-008: Create a new version of a rate card.
+    - Clones the existing card with a bumped version number
+    - Sets expiry_date on the parent to the day before new effective_date
+    - Marks parent as superseded
+    - Optionally copies all lanes and rate lines
+    """
+    from datetime import date as _date, timedelta
+
+    user_id = current_user.get("email", "system")
+
+    # Load parent card
+    parent_result = await db.execute(text("""
+        SELECT * FROM tms.carrier_rate_cards
+        WHERE rate_card_id = CAST(:id AS uuid)
+    """), {"id": card_id})
+    parent = parent_result.mappings().one_or_none()
+    if not parent:
+        raise HTTPException(404, "Rate card not found.")
+    parent = dict(parent)
+
+    # Find root card (for version family tracking)
+    root_id = str(parent.get("parent_rate_card_id") or card_id)
+
+    # Get next version number
+    version_result = await db.execute(text("""
+        SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version
+        FROM tms.carrier_rate_cards
+        WHERE parent_rate_card_id = CAST(:root_id AS uuid)
+           OR rate_card_id        = CAST(:root_id AS uuid)
+    """), {"root_id": root_id})
+    next_version = version_result.scalar() or 2
+
+    # New card's effective date
+    new_eff = _date.fromisoformat(payload.effective_date)
+    # Parent expiry = day before new effective
+    parent_expiry = new_eff - timedelta(days=1)
+
+    # Create new version card
+    new_card_result = await db.execute(text("""
+        INSERT INTO tms.carrier_rate_cards
+            (carrier_id, name, mode, currency, effective_date, expiry_date,
+             status, notes, rate_type, customer_party_id, contract_reference,
+             route_priority, version_number, parent_rate_card_id,
+             change_reason, changed_by)
+        VALUES
+            (CAST(:carrier_id AS uuid),
+             :name, :mode, :currency,
+             CAST(:effective_date AS date), CAST(:expiry_date AS date),
+             'active', :notes, :rate_type,
+             CAST(:customer_party_id AS uuid), :contract_reference,
+             :route_priority, :version_number, CAST(:parent_id AS uuid),
+             :change_reason, :changed_by)
+        RETURNING rate_card_id
+    """), {
+        "carrier_id":        parent["carrier_id"],
+        "name":              payload.name or parent["name"],
+        "mode":              parent["mode"],
+        "currency":          payload.currency or parent["currency"],
+        "effective_date":    new_eff,
+        "expiry_date":       payload.expiry_date,
+        "notes":             payload.notes or parent["notes"],
+        "rate_type":         payload.rate_type or parent["rate_type"],
+        "customer_party_id": parent.get("customer_party_id"),
+        "contract_reference":parent.get("contract_reference"),
+        "route_priority":    parent.get("route_priority", 0),
+        "version_number":    next_version,
+        "parent_id":         root_id,
+        "change_reason":     payload.change_reason,
+        "changed_by":        user_id,
+    })
+    new_card_id = str(new_card_result.scalar())
+
+    # Supersede parent
+    await db.execute(text("""
+        UPDATE tms.carrier_rate_cards
+        SET expiry_date     = CAST(:expiry AS date),
+            status          = 'expired',
+            superseded_by_id = CAST(:new_id AS uuid),
+            superseded_at   = NOW(),
+            updated_at      = NOW()
+        WHERE rate_card_id = CAST(:old_id AS uuid)
+    """), {"expiry": parent_expiry, "new_id": new_card_id, "old_id": card_id})
+
+    # Log audit
+    await db.execute(text("""
+        INSERT INTO tms.rate_card_audit_log
+            (rate_card_id, action, old_status, new_status,
+             old_expiry_date, new_expiry_date, version_number,
+             change_reason, changed_by)
+        VALUES
+            (CAST(:card_id AS uuid), 'versioned', 'active', 'expired',
+             CAST(:old_expiry AS date), CAST(:new_expiry AS date),
+             :version, :reason, :user)
+    """), {
+        "card_id":    card_id,
+        "old_expiry": _date.fromisoformat(str(parent.get("expiry_date"))) if parent.get("expiry_date") else None,
+        "new_expiry": parent_expiry,
+        "version":    next_version,
+        "reason":     payload.change_reason,
+        "user":       user_id,
+    })
+
+    await db.execute(text("""
+        INSERT INTO tms.rate_card_audit_log
+            (rate_card_id, action, old_status, new_status,
+             version_number, change_reason, changed_by)
+        VALUES
+            (CAST(:card_id AS uuid), 'created', NULL, 'active',
+             :version, :reason, :user)
+    """), {
+        "card_id": new_card_id,
+        "version": next_version,
+        "reason":  payload.change_reason,
+        "user":    user_id,
+    })
+
+    # Copy lanes + rate lines if requested
+    if payload.copy_lanes:
+        lanes_result = await db.execute(text("""
+            SELECT * FROM tms.carrier_rate_lanes
+            WHERE rate_card_id = CAST(:old_id AS uuid)
+        """), {"old_id": card_id})
+        lanes = lanes_result.mappings().all()
+
+        for lane in lanes:
+            new_lane_result = await db.execute(text("""
+                INSERT INTO tms.carrier_rate_lanes
+                    (rate_card_id, lane_name, origin_type, origin_value,
+                     destination_type, destination_value, min_weight_kg,
+                     max_weight_kg, min_distance_km, max_distance_km,
+                     priority, is_active)
+                VALUES
+                    (CAST(:rate_card_id AS uuid), :lane_name, :origin_type,
+                     :origin_value, :destination_type, :destination_value,
+                     :min_weight_kg, :max_weight_kg, :min_distance_km,
+                     :max_distance_km, :priority, :is_active)
+                RETURNING lane_id
+            """), {
+                "rate_card_id":      new_card_id,
+                "lane_name":         lane["lane_name"],
+                "origin_type":       lane["origin_type"],
+                "origin_value":      lane["origin_value"],
+                "destination_type":  lane["destination_type"],
+                "destination_value": lane["destination_value"],
+                "min_weight_kg":     lane["min_weight_kg"],
+                "max_weight_kg":     lane["max_weight_kg"],
+                "min_distance_km":   lane["min_distance_km"],
+                "max_distance_km":   lane["max_distance_km"],
+                "priority":          lane["priority"],
+                "is_active":         lane["is_active"],
+            })
+            new_lane_id = str(new_lane_result.scalar())
+
+            # Copy rate lines for this lane
+            rls_result = await db.execute(text("""
+                SELECT * FROM tms.carrier_rate_lines
+                WHERE lane_id = CAST(:lane_id AS uuid)
+            """), {"lane_id": str(lane["lane_id"])})
+            rate_lines = rls_result.mappings().all()
+
+            for rl in rate_lines:
+                await db.execute(text("""
+                    INSERT INTO tms.carrier_rate_lines
+                        (lane_id, charge_type, charge_code, description,
+                         rate_amount, currency, uom, min_charge, max_charge,
+                         formula_text, zone_value, is_active, sort_order)
+                    VALUES
+                        (CAST(:lane_id AS uuid), :charge_type, :charge_code,
+                         :description, :rate_amount, :currency, :uom,
+                         :min_charge, :max_charge, :formula_text, :zone_value,
+                         :is_active, :sort_order)
+                """), {
+                    "lane_id":      new_lane_id,
+                    "charge_type":  rl["charge_type"],
+                    "charge_code":  rl["charge_code"],
+                    "description":  rl["description"],
+                    "rate_amount":  rl["rate_amount"],
+                    "currency":     rl["currency"],
+                    "uom":          rl["uom"],
+                    "min_charge":   rl["min_charge"],
+                    "max_charge":   rl["max_charge"],
+                    "formula_text": rl.get("formula_text"),
+                    "zone_value":   rl.get("zone_value"),
+                    "is_active":    rl["is_active"],
+                    "sort_order":   rl["sort_order"],
+                })
+
+    await db.commit()
+
+    return {
+        "message":          f"Version {next_version} created successfully.",
+        "new_rate_card_id": new_card_id,
+        "parent_rate_card_id": card_id,
+        "version_number":   next_version,
+        "effective_date":   payload.effective_date,
+        "parent_expired_on":parent_expiry.isoformat(),
+        "lanes_copied":     payload.copy_lanes,
+    }
+
+
+@router.get("/rate-cards/{card_id}/versions")
+async def get_rate_card_versions(
+    card_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the full version history for a rate card family."""
+    # Find root
+    root_result = await db.execute(text("""
+        SELECT COALESCE(parent_rate_card_id, rate_card_id) AS root_id
+        FROM tms.carrier_rate_cards
+        WHERE rate_card_id = CAST(:id AS uuid)
+    """), {"id": card_id})
+    root_row = root_result.mappings().one_or_none()
+    if not root_row:
+        raise HTTPException(404, "Rate card not found.")
+    root_id = str(root_row["root_id"])
+
+    result = await db.execute(text("""
+        SELECT
+            rc.rate_card_id, rc.name, rc.mode, rc.rate_type,
+            rc.effective_date, rc.expiry_date, rc.status,
+            rc.version_number, rc.parent_rate_card_id,
+            rc.superseded_by_id, rc.superseded_at,
+            rc.change_reason, rc.changed_by,
+            rc.created_at, rc.updated_at,
+            p.party_name AS carrier_name,
+            COUNT(l.lane_id) AS lane_count
+        FROM tms.carrier_rate_cards rc
+        LEFT JOIN tms.carriers c  ON c.carrier_id = rc.carrier_id
+        LEFT JOIN tms.parties  p  ON p.party_id   = c.party_id
+        LEFT JOIN tms.carrier_rate_lanes l ON l.rate_card_id = rc.rate_card_id
+        WHERE rc.rate_card_id        = CAST(:root_id AS uuid)
+           OR rc.parent_rate_card_id = CAST(:root_id AS uuid)
+        GROUP BY rc.rate_card_id, p.party_name
+        ORDER BY rc.version_number DESC
+    """), {"root_id": root_id})
+
+    versions = [dict(r) for r in result.mappings().all()]
+
+    # Get audit log
+    audit_result = await db.execute(text("""
+        SELECT * FROM tms.rate_card_audit_log
+        WHERE rate_card_id IN (
+            SELECT rate_card_id FROM tms.carrier_rate_cards
+            WHERE rate_card_id        = CAST(:root_id AS uuid)
+               OR parent_rate_card_id = CAST(:root_id AS uuid)
+        )
+        ORDER BY changed_at DESC
+    """), {"root_id": root_id})
+    audit = [dict(r) for r in audit_result.mappings().all()]
+
+    return {
+        "root_rate_card_id": root_id,
+        "total_versions":    len(versions),
+        "versions":          versions,
+        "audit_log":         audit,
+    }
+
+
+@router.get("/rate-cards/effective")
+async def get_effective_rate_card(
+    carrier_id: str = Query(...),
+    mode: str = Query(...),
+    effective_date: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    TMS-RATE-008: Return the rate card version active on a specific date.
+    Defaults to today if no date provided.
+    """
+    from datetime import date as _date
+
+    eff = _date.fromisoformat(effective_date) if effective_date else None
+    params: dict[str, Any] = {"carrier_id": carrier_id, "mode": mode}
+
+    if eff:
+        date_filter = "AND rc.effective_date <= :eff_date AND (rc.expiry_date IS NULL OR rc.expiry_date >= :eff_date)"
+        params["eff_date"] = eff
+    else:
+        date_filter = "AND rc.effective_date <= CURRENT_DATE AND (rc.expiry_date IS NULL OR rc.expiry_date >= CURRENT_DATE)"
+
+    result = await db.execute(text(f"""
+        SELECT
+            rc.*,
+            p.party_name AS carrier_name,
+            COUNT(l.lane_id) AS lane_count
+        FROM tms.carrier_rate_cards rc
+        LEFT JOIN tms.carriers c ON c.carrier_id = rc.carrier_id
+        LEFT JOIN tms.parties  p ON p.party_id   = c.party_id
+        LEFT JOIN tms.carrier_rate_lanes l ON l.rate_card_id = rc.rate_card_id
+        WHERE rc.carrier_id = CAST(:carrier_id AS uuid)
+          AND rc.mode = :mode
+          AND rc.status = 'active'
+          {date_filter}
+        GROUP BY rc.rate_card_id, p.party_name
+        ORDER BY rc.version_number DESC
+        LIMIT 1
+    """), params)
+
+    row = result.mappings().one_or_none()
+    if not row:
+        raise HTTPException(404, f"No active rate card found for carrier {carrier_id} mode {mode} on {effective_date or 'today'}.")
+    return dict(row)
+
+
+@router.get("/rate-cards/{card_id}/audit")
+async def get_rate_card_audit(
+    card_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return audit log for a specific rate card."""
+    result = await db.execute(text("""
+        SELECT * FROM tms.rate_card_audit_log
+        WHERE rate_card_id = CAST(:id AS uuid)
+        ORDER BY changed_at DESC
+    """), {"id": card_id})
+    return [dict(r) for r in result.mappings().all()]
