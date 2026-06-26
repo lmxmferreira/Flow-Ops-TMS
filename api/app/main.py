@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import (
+    documents,
     rating,
     auth, shipments, carriers, dispatches,
     oms_events, purchase_orders, order_releases,
@@ -17,6 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(documents.router,       prefix="/api/v1/documents",        tags=["documents"])
 app.include_router(rating.router,           prefix="/api/v1/rating",            tags=["rating"])
 app.include_router(auth.router,            prefix="/api/v1/auth",            tags=["auth"])
 app.include_router(shipments.router,       prefix="/api/v1/shipments",       tags=["shipments"])
