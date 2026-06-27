@@ -101,7 +101,7 @@ export default function CarriersPage() {
   function load() {
     Promise.all([
       apiFetch('/carriers/?limit=100').catch(() => ({ data: [] })),
-      apiFetch('/carrier-mgmt/scorecards').catch(() => []),
+      Promise.resolve([]),
     ]).then(([c, s]) => {
       setCarriers(Array.isArray(c) ? c : c.data || [])
       setScorecards(Array.isArray(s) ? s : [])
