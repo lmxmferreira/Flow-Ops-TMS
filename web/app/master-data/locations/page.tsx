@@ -1,5 +1,6 @@
 'use client'
 import { useEffect, useState } from 'react'
+import Link from 'next/link'
 import { MapPin, Search, Plus, Pencil, X, CheckSquare, Square, Minus, Trash2 } from 'lucide-react'
 import { apiFetch, apiPost, apiPatch } from '../../../lib/api'
 
@@ -270,7 +271,7 @@ export default function LocationsPage() {
                     </button>
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-blue-600">{l.location_code}</td>
-                  <td className="px-4 py-3 font-medium text-gray-900">{l.location_name}</td>
+                  <td className="px-4 py-3 font-medium text-blue-600 hover:underline"><Link href={`/master-data/locations/${l.location_id}`}>{l.location_name}</Link></td>
                   <td className="px-4 py-3 text-gray-500 text-xs">{l.address_line1 || '—'}</td>
                   <td className="px-4 py-3 text-gray-600">{l.city || '—'}</td>
                   <td className="px-4 py-3 text-gray-500">{l.state_province || '—'}</td>

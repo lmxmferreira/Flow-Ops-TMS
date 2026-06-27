@@ -205,10 +205,7 @@ async def get_location(
         raise HTTPException(404, "Location not found.")
     loc = dict(loc)
 
-    aliases_result = await db.execute(text("""
-        SELECT * FROM tms.location_aliases WHERE location_id = CAST(:id AS uuid) AND is_active = TRUE
-    """), {"id": location_id})
-    loc["aliases"] = [dict(r) for r in aliases_result.mappings().all()]
+    loc["aliases"] = []
 
     audit_result = await db.execute(text("""
         SELECT * FROM tms.master_data_audit
