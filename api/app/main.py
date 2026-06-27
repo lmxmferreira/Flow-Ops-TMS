@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import (
+    e2e,
     master_data,
     documents,
     rating,
@@ -19,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(e2e.router,            prefix="/api/v1/e2e",               tags=["e2e"])
 app.include_router(master_data.router,     prefix="/api/v1/master-data",      tags=["master-data"])
 app.include_router(documents.router,       prefix="/api/v1/documents",        tags=["documents"])
 app.include_router(rating.router,           prefix="/api/v1/rating",            tags=["rating"])
