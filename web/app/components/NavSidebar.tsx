@@ -3,25 +3,31 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
   Package, Truck, Navigation, BarChart2, Settings,
-  LogOut, Building2, Zap, GitMerge, Hash, FileText, Activity, Globe, DollarSign, ShieldCheck, DollarSign, ShieldCheck
+  LogOut, Building2, Zap, GitMerge, Hash, FileText, Activity,
+  Globe, DollarSign, ShieldCheck, Receipt, MapPin, Database,
+  AlertTriangle, GitBranch, Layers, Search, ClipboardList
 } from 'lucide-react'
 
 const NAV = [
-  { href: '/dashboard',      label: 'Dashboard',      icon: BarChart2  },
-  { href: '/shipments',      label: 'Shipments',      icon: Package    },
-  { href: '/purchase-orders',label: 'Purchase Orders',icon: FileText   },
-  { href: '/order-releases', label: 'Order Releases', icon: Activity   },
-  { href: '/carriers',       label: 'Carriers',       icon: Truck      },
-  { href: '/dispatches',     label: 'Dispatches',     icon: Navigation },
-  { href: '/settings/rating', label: 'Rates',          icon: DollarSign },
+  { href: '/dashboard',         label: 'Dashboard',         icon: BarChart2     },
+  { href: '/shipments',         label: 'Shipments',         icon: Package       },
+  { href: '/execution',         label: 'Execution',         icon: Navigation    },
+  { href: '/purchase-orders',   label: 'Purchase Orders',   icon: FileText      },
+  { href: '/order-releases',    label: 'Order Releases',    icon: Activity      },
+  { href: '/carriers',          label: 'Carriers',          icon: Truck         },
+  { href: '/carrier-invoices',  label: 'Carrier Invoices',  icon: Receipt       },
+  { href: '/allocation',        label: 'Cost Allocation',   icon: Layers        },
+  { href: '/settings/rating',   label: 'Rates',             icon: DollarSign    },
+  { href: '/master-data',       label: 'Master Data',       icon: Database      },
+  { href: '/e2e',               label: 'Traceability',      icon: GitBranch     },
 ]
 
 const SETTINGS_NAV = [
-  { href: '/settings/organizations', label: 'Organizations', icon: Building2 },
-  { href: '/settings/workflows',     label: 'Workflows',     icon: Zap       },
-  { href: '/settings/status-models', label: 'Status Models', icon: GitMerge  },
-  { href: '/settings/numbering',     label: 'Numbering',     icon: Hash      },
-  { href: '/settings/global',        label: 'Global Settings',icon: Globe     },
+  { href: '/settings/organizations',    label: 'Organizations',    icon: Building2   },
+  { href: '/settings/workflows',        label: 'Workflows',        icon: Zap         },
+  { href: '/settings/status-models',    label: 'Status Models',    icon: GitMerge    },
+  { href: '/settings/numbering',        label: 'Numbering',        icon: Hash        },
+  { href: '/settings/global',           label: 'Global Settings',  icon: Globe       },
   { href: '/settings/validation-rules', label: 'Validation Rules', icon: ShieldCheck },
 ]
 
@@ -32,17 +38,21 @@ export default function NavSidebar() {
     window.location.href = '/login'
   }
 
+  const isActive = (href: string) => href === '/dashboard'
+    ? path === '/dashboard'
+    : path.startsWith(href)
+
   return (
     <aside className="w-56 bg-gray-900 text-gray-300 flex flex-col shrink-0">
       <div className="px-5 py-5 border-b border-gray-700">
         <span className="text-white font-bold text-lg tracking-tight">Flow Ops</span>
         <span className="ml-2 text-xs bg-blue-600 text-white px-1.5 py-0.5 rounded font-medium">TMS</span>
       </div>
-      <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+      <nav className="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
         {NAV.map(({ href, label, icon: Icon }) => (
           <Link key={href} href={href}
             className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-              path.startsWith(href) ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'
+              isActive(href) ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'
             }`}>
             <Icon size={16} />{label}
           </Link>
@@ -53,7 +63,7 @@ export default function NavSidebar() {
         {SETTINGS_NAV.map(({ href, label, icon: Icon }) => (
           <Link key={href} href={href}
             className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-              path.startsWith(href) ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'
+              isActive(href) ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'
             }`}>
             <Icon size={16} />{label}
           </Link>
