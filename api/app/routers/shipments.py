@@ -240,3 +240,28 @@ async def update_shipment(
     )
     await db.commit()
     return {"ok": True}
+
+@router.get("/{shipment_id}/stops")
+async def get_shipment_stops(shipment_id: str, db: AsyncSession = Depends(get_db), _=Depends(get_current_user)):
+    from sqlalchemy import text
+    sql = text("""
+        SELECT
+            ss.shipment_stop_id, ss.stop_sequence, ss.stop_type_id,
+            ss.planned_arrival_datetime, ss.actual_arrival_datetime,
+            ss.planned_departure_datetime, ss.actual_departure_datetime,
+            ss.appointment_datetime, ss.instructions, ss.stop_status_id,
+            ss.dwell_minutes, ss.detention_minutes, ss.late_minutes,
+            l.location_name, l.location_code, l.address_line1,
+            l.city, l.state_province, l.postal_code,
+            l.latitude, l.longitude,
+            COALESCE(lv_type.display_name, 'Stop') AS stop_type,
+            COALESCE(lv_status.display_name, 'Pending') AS stop_status
+        FROM tms.shipment_stops ss
+        LEFT JOIN tms.locations l ON l.location_id = ss.location_id
+        LEFT JOIN tms.lookup_values lv_type ON lv_type.lookup_value_id = ss.stop_type_id
+        LEFT JOIN tms.lookup_values lv_status ON lv_status.lookup_value_id = ss.stop_status_id
+        WHERE ss.shipment_id = CAST(:id AS uuid)
+        ORDER BY ss.stop_sequence
+    """)
+    result = await db.execute(sql, {"id": shipment_id})
+    return {"stops": [dict(r) for r in result.mappings().all()]}

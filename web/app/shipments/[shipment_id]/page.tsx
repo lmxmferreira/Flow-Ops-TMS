@@ -51,6 +51,7 @@ export default function ShipmentDetailPage() {
   const [exceptions, setExceptions] = useState<any>(null)
   const [lifecycle,  setLifecycle]  = useState<any>(null)
   const [loading,    setLoading]    = useState(true)
+  const [stops,      setStops]      = useState<any[]>([])
   const [tab,        setTab]        = useState('overview')
 
   useEffect(() => {
@@ -60,7 +61,9 @@ export default function ShipmentDetailPage() {
       apiFetch(`/execution/${id}/events`).catch(() => null),
       apiFetch(`/ops/exceptions?shipment_id=${id}`).catch(() => null),
       apiFetch(`/e2e/lifecycle/${id}`).catch(() => null),
-    ]).then(([shp, tr, exc, lc]) => {
+      apiFetch(`/shipments/${id}/stops`).catch(() => ({ stops: [] })),
+    ]).then(([shp, tr, exc, lc, st]) => {
+      setStops(st?.stops || [])
       setShipment(shp.shipment || shp)
       setTracking(tr)
       setExceptions(exc)
@@ -99,6 +102,7 @@ export default function ShipmentDetailPage() {
 
   const TABS = [
     { key: 'overview',   label: 'Overview',   icon: Truck },
+    { key: 'stops',      label: 'Stops',      icon: MapPin,     count: stops.length },
     { key: 'tracking',   label: 'Tracking',   icon: Navigation, count: trackEvents.length },
     { key: 'financials', label: 'Financials', icon: DollarSign },
     { key: 'documents',  label: 'Documents',  icon: FileText,   count: documents.length },
@@ -257,6 +261,68 @@ export default function ShipmentDetailPage() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+
+      {tab === 'stops' && (
+        <div className="bg-white rounded-xl border border-gray-200 p-5">
+          <h3 className="text-sm font-bold text-gray-700 mb-5 flex items-center gap-2">
+            <MapPin size={14} className="text-green-600"/> Shipment Stops
+          </h3>
+          {stops.length === 0 ? (
+            <div className="text-center py-10"><MapPin size={28} className="text-gray-200 mx-auto mb-3"/><p className="text-sm text-gray-400">No stops recorded</p></div>
+          ) : (
+            <div className="space-y-0">
+              {stops.map((stop: any, i: number) => {
+                const arrived = !!stop.actual_arrival_datetime
+                const departed = !!stop.actual_departure_datetime
+                return (
+                  <div key={stop.shipment_stop_id} className="flex gap-4">
+                    <div className="flex flex-col items-center w-10 flex-shrink-0">
+                      <div className={`w-10 h-10 rounded-full border-2 flex items-center justify-center text-sm font-bold flex-shrink-0 ${departed ? 'border-green-400 bg-green-400 text-white' : arrived ? 'border-blue-400 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-400'}`}>
+                        {stop.stop_sequence}
+                      </div>
+                      {i < stops.length - 1 && <div className={`w-0.5 flex-1 my-1 min-h-8 ${departed ? 'bg-green-300' : 'bg-gray-200'}`}/>}
+                    </div>
+                    <div className={`flex-1 pb-6 ${i === stops.length - 1 ? 'pb-0' : ''}`}>
+                      <div className="flex items-start justify-between gap-2 mb-3">
+                        <div>
+                          <p className="text-sm font-bold text-gray-900">{stop.location_name || 'Unknown Location'}</p>
+                          <p className="text-xs text-gray-500 mt-0.5">{[stop.address_line1, stop.city, stop.state_province, stop.postal_code].filter(Boolean).join(', ')}</p>
+                          <p className="text-xs text-gray-400 capitalize mt-0.5">{stop.stop_type}</p>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {stop.late_minutes > 0 && <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium">{stop.late_minutes}m late</span>}
+                          {stop.detention_minutes > 0 && <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium">{stop.detention_minutes}m detention</span>}
+                          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${departed ? 'bg-green-100 text-green-700' : arrived ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-500'}`}>
+                            {departed ? 'Departed' : arrived ? 'Arrived' : stop.stop_status}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 bg-gray-50 rounded-xl p-4">
+                        {[
+                          ['Planned Arrival', stop.planned_arrival_datetime, false],
+                          ['Actual Arrival', stop.actual_arrival_datetime, arrived],
+                          ['Planned Departure', stop.planned_departure_datetime, false],
+                          ['Actual Departure', stop.actual_departure_datetime, departed],
+                        ].map(([label, val, highlight]: any) => (
+                          <div key={label as string}>
+                            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wide mb-0.5">{label}</p>
+                            <p className={`text-xs font-medium ${highlight ? 'text-green-700' : val ? 'text-gray-700' : 'text-gray-300'}`}>
+                              {val ? new Date(val).toLocaleString() : 'Not recorded'}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                      {stop.dwell_minutes > 0 && <p className="text-xs text-gray-500 mt-2">Dwell: <span className="font-medium">{stop.dwell_minutes}m</span></p>}
+                      {stop.instructions && <p className="text-xs text-gray-500 mt-1 italic">{stop.instructions}</p>}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       )}
 
