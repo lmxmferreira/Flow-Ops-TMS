@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import (
+    freight_audit,
+    freight_audit,
     execution,
     allocation,
     carrier_invoices,
@@ -25,6 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(freight_audit.router,   prefix="/api/v1/audit",             tags=["freight-audit"])
+app.include_router(freight_audit.router,   prefix="/api/v1/audit",             tags=["freight-audit"])
 app.include_router(execution.router,       prefix="/api/v1/execution",         tags=["execution"])
 app.include_router(allocation.router,       prefix="/api/v1/allocation",         tags=["allocation"])
 app.include_router(carrier_invoices.router,    prefix="/api/v1/carrier-invoices",  tags=["carrier-invoices"])

@@ -259,3 +259,121 @@ async def get_order_release(
         "events":    [dict(r) for r in events],
         "shipments": [dict(r) for r in shipments],
     }
+
+
+from pydantic import BaseModel
+from typing import Optional
+
+class OrderReleaseCreate(BaseModel):
+    source_purchase_order_id: Optional[str] = None
+    customer_party_id: Optional[str] = None
+    supplier_party_id: Optional[str] = None
+    shipper_location_id: Optional[str] = None
+    consignee_location_id: Optional[str] = None
+    requested_ship_date: Optional[str] = None
+    requested_delivery_date: Optional[str] = None
+    transport_mode_id: Optional[str] = None
+    service_level_id: Optional[str] = None
+    freight_terms_id: Optional[str] = None
+    priority: Optional[str] = "Medium"
+    notes: Optional[str] = None
+
+class OrderReleaseUpdate(BaseModel):
+    requested_ship_date: Optional[str] = None
+    requested_delivery_date: Optional[str] = None
+    priority: Optional[str] = None
+    notes: Optional[str] = None
+    override_reason: Optional[str] = None
+
+@router.post("/", status_code=201)
+async def create_order_release(
+    payload: OrderReleaseCreate,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Create a new order release."""
+    from datetime import datetime
+    user_id = user.get("email", "system")
+    # Generate release number
+    result = await db.execute(text("""
+        SELECT COUNT(*) FROM tms.order_releases
+    """))
+    count = result.scalar() or 0
+    release_number = f"REL-{datetime.utcnow().strftime('%Y')}-{str(count + 1).zfill(4)}"
+
+    # Get DRAFT status
+    status_result = await db.execute(text("""
+        SELECT lookup_value_id FROM tms.lookup_values
+        WHERE UPPER(lookup_code) = 'DRAFT' LIMIT 1
+    """))
+    status_id = status_result.scalar()
+
+    rel_result = await db.execute(text("""
+        INSERT INTO tms.order_releases
+            (order_release_number, source_purchase_order_id,
+             customer_party_id, supplier_party_id,
+             shipper_location_id, consignee_location_id,
+             requested_ship_date, requested_delivery_date,
+             transport_mode_id, service_level_id,
+             freight_terms_id, release_status_id)
+        VALUES
+            (:release_number, CAST(:po_id AS uuid),
+             CAST(:customer_id AS uuid), CAST(:supplier_id AS uuid),
+             CAST(:shipper_id AS uuid), CAST(:consignee_id AS uuid),
+             CAST(:ship_date AS date), CAST(:delivery_date AS date),
+             CAST(:mode_id AS uuid), CAST(:service_id AS uuid),
+             CAST(:terms_id AS uuid), CAST(:status_id AS uuid))
+        RETURNING order_release_id, order_release_number
+    """), {
+        "release_number":  release_number,
+        "po_id":           payload.source_purchase_order_id,
+        "customer_id":     payload.customer_party_id,
+        "supplier_id":     payload.supplier_party_id,
+        "shipper_id":      payload.shipper_location_id,
+        "consignee_id":    payload.consignee_location_id,
+        "ship_date":       payload.requested_ship_date,
+        "delivery_date":   payload.requested_delivery_date,
+        "mode_id":         payload.transport_mode_id,
+        "service_id":      payload.service_level_id,
+        "terms_id":        payload.freight_terms_id,
+        "status_id":       str(status_id) if status_id else None,
+    })
+    await db.commit()
+    row = dict(rel_result.mappings().one())
+    return {"order_release_id": str(row["order_release_id"]),
+            "order_release_number": row["order_release_number"],
+            "status": "DRAFT"}
+
+
+@router.patch("/{release_id}")
+async def update_order_release(
+    release_id: str,
+    payload: OrderReleaseUpdate,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Update an order release."""
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        from fastapi import HTTPException
+        raise HTTPException(400, "No fields to update.")
+    set_parts = []
+    params: dict = {"id": release_id}
+    for k, v in updates.items():
+        if k in ("requested_ship_date", "requested_delivery_date") and v:
+            set_parts.append(f"{k} = CAST(:{k} AS date)")
+        else:
+            set_parts.append(f"{k} = :{k}")
+        params[k] = v
+    set_parts.append("updated_at = NOW()")
+    result = await db.execute(text(f"""
+        UPDATE tms.order_releases SET {', '.join(set_parts)}
+        WHERE order_release_id = CAST(:id AS uuid)
+        RETURNING order_release_id, updated_at
+    """), params)
+    await db.commit()
+    row = result.mappings().one_or_none()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(404, "Release not found.")
+    return dict(row)
