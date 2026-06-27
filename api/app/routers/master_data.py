@@ -834,3 +834,58 @@ async def get_lane_lines(rate_card_id: str, lane_id: str, db: AsyncSession = Dep
         ORDER BY sort_order, charge_code
     """), {"id": lane_id})
     return {"lines": [dict(r) for r in result.mappings().all()]}
+
+@router.post("/locations", status_code=201)
+async def create_location(payload: dict, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    result = await db.execute(text("""
+        INSERT INTO tms.locations (location_code, location_name, address_line1, address_line2,
+            city, state_province, postal_code, latitude, longitude, time_zone, created_at, updated_at)
+        VALUES (:location_code, :location_name, :address_line1, :address_line2,
+            :city, :state_province, :postal_code, :latitude, :longitude, :time_zone, NOW(), NOW())
+        RETURNING location_id
+    """), {
+        "location_code": payload.get("location_code"),
+        "location_name": payload.get("location_name"),
+        "address_line1": payload.get("address_line1"),
+        "address_line2": payload.get("address_line2"),
+        "city": payload.get("city"),
+        "state_province": payload.get("state_province"),
+        "postal_code": payload.get("postal_code"),
+        "latitude": payload.get("latitude"),
+        "longitude": payload.get("longitude"),
+        "time_zone": payload.get("time_zone"),
+    })
+    await db.commit()
+    return {"location_id": str(result.scalar())}
+
+@router.patch("/locations/{location_id}")
+async def update_location(location_id: str, payload: dict, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    await db.execute(text("""
+        UPDATE tms.locations SET
+            location_code = COALESCE(:location_code, location_code),
+            location_name = COALESCE(:location_name, location_name),
+            address_line1 = :address_line1,
+            address_line2 = :address_line2,
+            city = :city,
+            state_province = :state_province,
+            postal_code = :postal_code,
+            latitude = :latitude,
+            longitude = :longitude,
+            time_zone = :time_zone,
+            updated_at = NOW()
+        WHERE location_id = CAST(:id AS uuid)
+    """), {
+        "id": location_id,
+        "location_code": payload.get("location_code"),
+        "location_name": payload.get("location_name"),
+        "address_line1": payload.get("address_line1"),
+        "address_line2": payload.get("address_line2"),
+        "city": payload.get("city"),
+        "state_province": payload.get("state_province"),
+        "postal_code": payload.get("postal_code"),
+        "latitude": payload.get("latitude"),
+        "longitude": payload.get("longitude"),
+        "time_zone": payload.get("time_zone"),
+    })
+    await db.commit()
+    return {"location_id": location_id}
