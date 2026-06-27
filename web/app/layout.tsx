@@ -13,6 +13,7 @@ const NAV = [
   { label: 'Financials', icon: DollarSign, children: [{ label: 'Carrier Invoices', href: '/carrier-invoices' }, { label: 'Freight Audit', href: '/freight-audit' }, { label: 'Cost Allocation', href: '/allocation' }, { label: 'Client Billing', href: '/billing' }, { label: 'Accruals & GL', href: '/financials' }] },
   { label: 'Operations', icon: Activity, children: [{ label: 'Exceptions & Claims', href: '/exceptions' }, { label: 'Yard & Gate', href: '/yard' }] },
   { label: 'Documents', icon: FileText, children: [{ label: 'Documents', href: '/documents' }] },
+  { label: 'Rates', icon: DollarSign, children: [{ label: 'Overview', href: '/rates' }, { label: 'Rate Regions', href: '/rates/regions' }, { label: 'Rate Cards', href: '/rates/rate-cards' }] },
   { label: 'Master Data', icon: Database, children: [
     { label: 'Overview', href: '/master-data' },
     { label: 'Locations', href: '/master-data/locations' },

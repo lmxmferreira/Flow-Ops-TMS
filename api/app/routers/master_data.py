@@ -734,3 +734,103 @@ async def _audit_log(db, entity_type: str, entity_id: str, action: str,
         })
     except Exception:
         pass  # Audit log failures should never break main flow
+
+# ── RATE REGIONS ──────────────────────────────────────────────
+
+@router.get("/rate-regions")
+async def list_rate_regions(db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    result = await db.execute(text("""
+        SELECT r.*, COUNT(m.member_id) AS member_count
+        FROM tms.rate_regions r
+        LEFT JOIN tms.rate_region_members m ON m.region_id = r.region_id
+        WHERE r.is_active = TRUE
+        GROUP BY r.region_id
+        ORDER BY r.region_name
+    """))
+    return {"regions": [dict(row) for row in result.mappings().all()]}
+
+@router.get("/rate-regions/{region_id}")
+async def get_rate_region(region_id: str, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    r = await db.execute(text("SELECT * FROM tms.rate_regions WHERE region_id = CAST(:id AS uuid)"), {"id": region_id})
+    region = r.mappings().first()
+    if not region:
+        raise HTTPException(status_code=404, detail="Region not found")
+    m = await db.execute(text("SELECT * FROM tms.rate_region_members WHERE region_id = CAST(:id AS uuid) ORDER BY member_type, member_value"), {"id": region_id})
+    return {"region": dict(region), "members": [dict(row) for row in m.mappings().all()]}
+
+@router.post("/rate-regions", status_code=201)
+async def create_rate_region(payload: dict, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    from sqlalchemy import text as t
+    result = await db.execute(text("""
+        INSERT INTO tms.rate_regions (region_code, region_name, region_type, description, created_by)
+        VALUES (:code, :name, :type, :desc, :by)
+        RETURNING region_id
+    """), {"code": payload["region_code"], "name": payload["region_name"],
+           "type": payload.get("region_type","custom"), "desc": payload.get("description",""),
+           "by": str(user.user_id)})
+    await db.commit()
+    return {"region_id": str(result.scalar())}
+
+@router.post("/rate-regions/{region_id}/members", status_code=201)
+async def add_region_member(region_id: str, payload: dict, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    result = await db.execute(text("""
+        INSERT INTO tms.rate_region_members (region_id, member_type, member_value, member_value_to, country_code)
+        VALUES (CAST(:rid AS uuid), :mtype, :mval, :mval_to, :country)
+        RETURNING member_id
+    """), {"rid": region_id, "mtype": payload["member_type"], "mval": payload["member_value"],
+           "mval_to": payload.get("member_value_to"), "country": payload.get("country_code","US")})
+    await db.commit()
+    return {"member_id": str(result.scalar())}
+
+@router.delete("/rate-regions/{region_id}/members/{member_id}", status_code=204)
+async def remove_region_member(region_id: str, member_id: str, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    await db.execute(text("DELETE FROM tms.rate_region_members WHERE member_id = CAST(:id AS uuid)"), {"id": member_id})
+    await db.commit()
+
+# ── RATE CARDS ────────────────────────────────────────────────
+
+@router.get("/rate-cards")
+async def list_rate_cards(db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    result = await db.execute(text("""
+        SELECT rc.*, p.party_name AS carrier_name,
+               COUNT(DISTINCT rl.lane_id) AS lane_count,
+               COUNT(DISTINCT rli.rate_line_id) AS line_count
+        FROM tms.carrier_rate_cards rc
+        LEFT JOIN tms.carriers c ON c.carrier_id = rc.carrier_id
+        LEFT JOIN tms.parties p ON p.party_id = c.party_id
+        LEFT JOIN tms.carrier_rate_lanes rl ON rl.rate_card_id = rc.rate_card_id
+        LEFT JOIN tms.carrier_rate_lines rli ON rli.lane_id = rl.lane_id
+        GROUP BY rc.rate_card_id, p.party_name
+        ORDER BY rc.effective_date DESC NULLS LAST
+    """))
+    return {"rate_cards": [dict(row) for row in result.mappings().all()]}
+
+@router.get("/rate-cards/{rate_card_id}")
+async def get_rate_card(rate_card_id: str, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    rc = await db.execute(text("""
+        SELECT rc.*, p.party_name AS carrier_name
+        FROM tms.carrier_rate_cards rc
+        LEFT JOIN tms.carriers c ON c.carrier_id = rc.carrier_id
+        LEFT JOIN tms.parties p ON p.party_id = c.party_id
+        WHERE rc.rate_card_id = CAST(:id AS uuid)
+    """), {"id": rate_card_id})
+    card = rc.mappings().first()
+    if not card:
+        raise HTTPException(status_code=404, detail="Rate card not found")
+    lanes = await db.execute(text("""
+        SELECT rl.*, COUNT(rli.rate_line_id) AS line_count
+        FROM tms.carrier_rate_lanes rl
+        LEFT JOIN tms.carrier_rate_lines rli ON rli.lane_id = rl.lane_id
+        WHERE rl.rate_card_id = CAST(:id AS uuid)
+        GROUP BY rl.lane_id ORDER BY rl.priority
+    """), {"id": rate_card_id})
+    return {"rate_card": dict(card), "lanes": [dict(r) for r in lanes.mappings().all()]}
+
+@router.get("/rate-cards/{rate_card_id}/lanes/{lane_id}/lines")
+async def get_lane_lines(rate_card_id: str, lane_id: str, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    result = await db.execute(text("""
+        SELECT * FROM tms.carrier_rate_lines
+        WHERE lane_id = CAST(:id AS uuid) AND is_active = TRUE
+        ORDER BY sort_order, charge_code
+    """), {"id": lane_id})
+    return {"lines": [dict(r) for r in result.mappings().all()]}
