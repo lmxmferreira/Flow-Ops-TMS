@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import './globals.css'
-import { LayoutDashboard, ShoppingCart, Truck, Users, DollarSign, FileText, Shield, Search, Settings, Activity, ChevronDown, ChevronRight, LogOut, Bell, Menu } from 'lucide-react'
+import { LayoutDashboard, ShoppingCart, Truck, Users, DollarSign, FileText, Shield, Search, Settings, Activity, ChevronDown, ChevronRight, LogOut, Bell, Menu, Database, MapPin } from 'lucide-react'
 
 const NAV = [
   { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
@@ -12,7 +12,13 @@ const NAV = [
   { label: 'Carriers', icon: Users, children: [{ label: 'Carrier Management', href: '/carriers' }, { label: 'Rating', href: '/rating' }] },
   { label: 'Financials', icon: DollarSign, children: [{ label: 'Carrier Invoices', href: '/carrier-invoices' }, { label: 'Freight Audit', href: '/freight-audit' }, { label: 'Cost Allocation', href: '/allocation' }, { label: 'Client Billing', href: '/billing' }, { label: 'Accruals & GL', href: '/financials' }] },
   { label: 'Operations', icon: Activity, children: [{ label: 'Exceptions & Claims', href: '/exceptions' }, { label: 'Yard & Gate', href: '/yard' }] },
-  { label: 'Documents', icon: FileText, children: [{ label: 'Documents', href: '/documents' }, { label: 'Master Data', href: '/master-data' }] },
+  { label: 'Documents', icon: FileText, children: [{ label: 'Documents', href: '/documents' }] },
+  { label: 'Master Data', icon: Database, children: [
+    { label: 'Overview', href: '/master-data' },
+    { label: 'Locations', href: '/master-data/locations' },
+    { label: 'Items & Products', href: '/master-data/items' },
+    { label: 'Charge Codes', href: '/master-data/charge-codes' },
+  ]},
   { label: 'Platform', icon: Settings, children: [{ label: 'Integration', href: '/integration' }, { label: 'Reports', href: '/reports' }, { label: 'Security & Audit', href: '/security' }, { label: 'Workflows', href: '/workflows' }] },
   { label: 'E2E Traceability', href: '/e2e', icon: Search },
   { label: 'System Health', href: '/system', icon: Shield },
