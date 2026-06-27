@@ -13,7 +13,7 @@ export default function CarriersPage() {
 
   useEffect(() => {
     Promise.all([
-      apiFetch('/carrier-mgmt/carriers').catch(() => []),
+      apiFetch('/carriers/').catch(() => []),
       apiFetch('/carrier-mgmt/scorecards').catch(() => []),
     ]).then(([c, s]) => {
       setCarriers(Array.isArray(c) ? c : [])
