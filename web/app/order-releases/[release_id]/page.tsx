@@ -6,7 +6,7 @@ import {
   ArrowLeft, FileText, MapPin, Truck, Calendar,
   AlertTriangle, Package, Activity, Ship
 } from 'lucide-react'
-import { api } from '../../lib/api'
+import { apiFetch as api } from '../../lib/api'
 
 interface OrderRelease {
   order_release_id: string
@@ -145,7 +145,7 @@ export default function OrderReleaseDetailPage() {
 
   useEffect(() => {
     if (!params.release_id) return
-    api.orderReleases.get(params.release_id)
+    api(`/order-releases/${params.release_id}`)
       .then((res: { order_release: OrderRelease; lines: ReleaseLine[]; events: ReleaseEvent[]; shipments: LinkedShipment[] }) => {
         setRelease(res.order_release)
         setLines(res.lines)
