@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import (
+    nfr_ac,
     platform,
     exc_yard,
     financials,
@@ -31,11 +32,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(nfr_ac.router,          prefix="/api/v1/system",             tags=["system"])
 app.include_router(platform.router,         prefix="/api/v1/platform",           tags=["platform"])
 app.include_router(exc_yard.router,        prefix="/api/v1/ops",               tags=["exc-yard"])
 app.include_router(financials.router,       prefix="/api/v1/financials",         tags=["financials"])
 app.include_router(billing.router,          prefix="/api/v1/billing",            tags=["billing"])
 app.include_router(freight_audit.router,   prefix="/api/v1/audit",             tags=["freight-audit"])
+app.include_router(nfr_ac.router,          prefix="/api/v1/system",             tags=["system"])
 app.include_router(platform.router,         prefix="/api/v1/platform",           tags=["platform"])
 app.include_router(exc_yard.router,        prefix="/api/v1/ops",               tags=["exc-yard"])
 app.include_router(financials.router,       prefix="/api/v1/financials",         tags=["financials"])
