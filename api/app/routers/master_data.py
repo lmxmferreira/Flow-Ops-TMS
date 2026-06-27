@@ -143,18 +143,12 @@ async def list_locations(
     if country_id:
         conditions.append("l.country_id = CAST(:country_id AS uuid)")
         params["country_id"] = country_id
-    if active_only:
-        conditions.append("l.is_active = TRUE")
-
     result = await db.execute(text(f"""
         SELECT l.*,
-               p.party_name, p.party_code,
-               COUNT(la.alias_id) AS alias_count
+               p.party_name, p.party_code
         FROM tms.locations l
         LEFT JOIN tms.parties p ON p.party_id = l.party_id
-        LEFT JOIN tms.location_aliases la ON la.location_id = l.location_id AND la.is_active = TRUE
         WHERE {' AND '.join(conditions)}
-        GROUP BY l.location_id, p.party_name, p.party_code
         ORDER BY l.location_name
         LIMIT :limit OFFSET :offset
     """), params)
