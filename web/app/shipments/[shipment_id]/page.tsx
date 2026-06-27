@@ -6,7 +6,7 @@ import {
   ArrowLeft, Package, Truck, MapPin, Calendar, DollarSign,
   Scale, FileText, AlertTriangle, Pencil, X, Save, RefreshCw, Check
 } from 'lucide-react'
-import { api } from '../../lib/api'
+import { apiFetch as api } from '../../lib/api'
 
 // ── Types ──────────────────────────────────────────────────────
 interface Shipment {

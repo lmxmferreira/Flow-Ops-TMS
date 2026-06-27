@@ -5,7 +5,7 @@ import {
   ArrowLeft, FileText, AlertTriangle, CheckCircle, Clock,
   MapPin, Building, DollarSign, Package, History, Pencil, X, Save
 } from 'lucide-react'
-import { api } from '../../lib/api'
+import { apiFetch as api } from '../../lib/api'
 
 // ── Types ────────────────────────────────────────────────────
 interface PO {

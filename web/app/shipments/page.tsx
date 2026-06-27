@@ -6,6 +6,11 @@ import { apiFetch, fmtDate, fmtCurrency, statusColor } from '../../lib/api'
 
 const STAGE_COLORS: Record<string, string> = {
   planned: 'bg-gray-100 text-gray-600',
+  PLANNED: 'bg-gray-100 text-gray-600',
+  DELIVERED: 'bg-green-100 text-green-700',
+  ACCEPTED: 'bg-purple-100 text-purple-700',
+  DISPATCHED: 'bg-blue-100 text-blue-700',
+  CLOSED: 'bg-gray-50 text-gray-400',
   dispatched: 'bg-blue-100 text-blue-700',
   in_transit: 'bg-indigo-100 text-indigo-700',
   delivered: 'bg-green-100 text-green-700',
@@ -32,11 +37,11 @@ export default function ShipmentsPage() {
       s.shipment_number?.toLowerCase().includes(search.toLowerCase()) ||
       s.carrier_name?.toLowerCase().includes(search.toLowerCase()) ||
       s.customer_name?.toLowerCase().includes(search.toLowerCase())
-    const matchStage = !stageFilter || s.current_stage === stageFilter
+    const matchStage = !stageFilter || s.status_code === stageFilter
     return matchSearch && matchStage
   })
 
-  const stages = [...new Set(shipments.map(s => s.current_stage).filter(Boolean))]
+  const stages = [...new Set(shipments.map(s => s.status_code).filter(Boolean))]
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -58,7 +63,7 @@ export default function ShipmentsPage() {
         {stages.map(s => (
           <button key={s} onClick={() => setStageFilter(s === stageFilter ? '' : s)}
             className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${stageFilter === s ? 'bg-blue-600 text-white' : `${STAGE_COLORS[s] || 'bg-gray-100 text-gray-600'} hover:opacity-80`}`}>
-            {s.replace(/_/g, ' ')} ({shipments.filter(sh => sh.current_stage === s).length})
+            {s.replace(/_/g, ' ')} ({shipments.filter(sh => sh.status_code === s).length})
           </button>
         ))}
       </div>
@@ -99,12 +104,12 @@ export default function ShipmentsPage() {
                     {[s.origin_city, s.destination_city].filter(Boolean).join(' → ') || '—'}
                   </div>
                 </td>
-                <td className="px-4 py-3 text-gray-500">{fmtDate(s.planned_pickup_date)}</td>
-                <td className="px-4 py-3 text-gray-500">{fmtDate(s.planned_delivery_date)}</td>
-                <td className="px-4 py-3 font-medium">{s.total_cost ? fmtCurrency(s.total_cost) : '—'}</td>
+                <td className="px-4 py-3 text-gray-500">{fmtDate(s.planned_pickup_datetimetime)}</td>
+                <td className="px-4 py-3 text-gray-500">{fmtDate(s.planned_delivery_datetimetime)}</td>
+                <td className="px-4 py-3 font-medium">{null ? fmtCurrency(null) : '—'}</td>
                 <td className="px-4 py-3">
-                  <span className={`px-2 py-1 rounded-full text-xs font-medium ${STAGE_COLORS[s.current_stage] || 'bg-gray-100 text-gray-500'}`}>
-                    {s.current_stage?.replace(/_/g, ' ') || 'planned'}
+                  <span className={`px-2 py-1 rounded-full text-xs font-medium ${STAGE_COLORS[s.status_code] || 'bg-gray-100 text-gray-500'}`}>
+                    {s.status_code?.replace(/_/g, ' ') || 'planned'}
                   </span>
                 </td>
                 <td className="px-4 py-3">

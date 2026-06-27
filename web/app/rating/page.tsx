@@ -14,8 +14,8 @@ export default function RatingPage() {
 
   useEffect(() => {
     Promise.all([
-      apiFetch('/carriers/rate-cards?limit=50').catch(() => []),
-      apiFetch('/shipments/costs?limit=100').catch(() => []),
+      apiFetch('/carrier-mgmt/carriers?limit=50').catch(() => []),
+      apiFetch('/shipments/?limit=20').catch(() => []),
     ]).then(([r, c]) => {
       setRatecards(Array.isArray(r) ? r : [])
       setCosts(Array.isArray(c) ? c : [])
@@ -27,7 +27,7 @@ export default function RatingPage() {
     if (!rateForm.shipment_id) return
     setRateLoading(true)
     try {
-      const result = await apiFetch(`/shipments/${rateForm.shipment_id}/costs`)
+      const result = await apiFetch(`/shipments/${rateForm.shipment_id}`)
       setRateResult(result)
     } catch {
       setRateResult({ error: 'Rating failed' })

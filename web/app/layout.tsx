@@ -57,8 +57,7 @@ function Shell({ children }: { children: React.ReactNode }) {
     <div className="flex h-screen bg-gray-50 overflow-hidden">
       <aside className={`${open ? 'w-60' : 'w-0'} flex-shrink-0 transition-all duration-200 overflow-hidden bg-white border-r border-gray-200 flex flex-col`}>
         <div className="flex items-center gap-2.5 px-4 py-4 border-b border-gray-100">
-          <div className="w-7 h-7 bg-blue-600 rounded-lg flex items-center justify-center"><Truck size={14} className="text-white"/></div>
-          <div><p className="text-sm font-bold text-gray-900 leading-none">Flow Ops</p><p className="text-[10px] text-gray-400 leading-none mt-0.5">TMS Platform</p></div>
+          <img src="/logo.png" alt="Flow Ops Global" className="h-9 w-auto object-contain" />
         </div>
         <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
           {NAV.map((item, i) => <NavItem key={i} item={item}/>)}
