@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import (
+    execution,
     allocation,
     carrier_invoices,
     carrier_management,
@@ -24,6 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(execution.router,       prefix="/api/v1/execution",         tags=["execution"])
 app.include_router(allocation.router,       prefix="/api/v1/allocation",         tags=["allocation"])
 app.include_router(carrier_invoices.router,    prefix="/api/v1/carrier-invoices",  tags=["carrier-invoices"])
 app.include_router(carrier_management.router, prefix="/api/v1/carrier-mgmt",    tags=["carrier-management"])
