@@ -1,555 +1,367 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
+import Link from 'next/link'
 import {
-  ArrowLeft, FileText, AlertTriangle, CheckCircle, Clock,
-  MapPin, Building, DollarSign, Package, History, Pencil, X, Save
+  ArrowLeft, Package, ChevronRight, Building2, MapPin, DollarSign,
+  Calendar, Tag, AlertTriangle, CheckCircle, Layers, Truck,
+  BarChart3, FileText, Clock, ExternalLink
 } from 'lucide-react'
-import { apiFetch as api } from '../../lib/api'
+import { apiFetch, fmtDate, fmtCurrency, statusColor } from '../../../lib/api'
 
-// ── Types ────────────────────────────────────────────────────
-interface PO {
-  purchase_order_id: string
-  purchase_order_number: string
-  source_reference: string
-  po_type: string
-  status_code: string
-  status_name: string
-  supplier_name: string
-  supplier_code: string
-  supplier_tax_id: string
-  buyer_name: string
-  buyer_code: string
-  ship_from_name: string
-  ship_from_address: string
-  ship_from_city: string
-  ship_from_state: string
-  ship_from_zip: string
-  ship_from_country: string
-  ship_to_name: string
-  ship_to_address: string
-  ship_to_city: string
-  ship_to_state: string
-  ship_to_zip: string
-  ship_to_country: string
-  requested_ship_date: string | null
-  requested_delivery_date: string | null
-  incoterm: string
-  freight_terms: string
-  currency: string
-  payment_terms: string
-  priority: string
-  hold_flag: boolean
-  hold_reason: string
-  version_number: number
-  business_unit: string
-  project: string
-  cost_center: string
-  source_system: string
-  created_at: string
-  updated_at: string
-}
-
-interface POLine {
-  purchase_order_line_id: string
-  line_number: string
-  item_number: string
-  item_name: string
-  item_description: string
-  status_code: string
-  status_name: string
-  ordered_quantity: number
-  releasable_quantity: number
-  released_quantity: number
-  planned_quantity: number
-  shipped_quantity: number
-  delivered_quantity: number
-  received_quantity: number
-  canceled_quantity: number
-  remaining_quantity: number
-  quantity_uom: string
-  weight_value: number | null
-  weight_uom: string
-  volume_value: number | null
-  volume_uom: string
-  line_value: number | null
-  currency: string
-  freight_class: string
-  packaging_type: string
-  hazardous_flag: boolean
-  temperature_requirement: string
-  requested_ship_date: string | null
-  requested_delivery_date: string | null
-  hold_flag: boolean
-  hold_reason: string
-}
-
-interface POVersion {
-  version_number: number
-  change_reason: string
-  created_by: string
-  created_at: string
-}
-
-// ── Helpers ──────────────────────────────────────────────────
 const STATUS_COLORS: Record<string, string> = {
   OPEN:               'bg-blue-100 text-blue-700',
-  RECEIVED:           'bg-blue-50 text-blue-700',
-  VALIDATED:          'bg-cyan-50 text-cyan-700',
-  RELEASED:           'bg-indigo-100 text-indigo-700',
-  PARTIALLY_RELEASED: 'bg-purple-50 text-purple-700',
-  FULLY_RELEASED:     'bg-indigo-50 text-indigo-700',
-  SHIPPED:            'bg-orange-50 text-orange-700',
-  PARTIALLY_RECEIVED: 'bg-lime-50 text-lime-700',
-  CLOSED:             'bg-green-100 text-green-700',
-  CANCELLED:          'bg-red-100 text-red-700',
-  CANCELED:           'bg-red-100 text-red-700',
-  ON_HOLD:            'bg-yellow-100 text-yellow-800',
-  EXCEPTION:          'bg-rose-100 text-rose-700',
-  UNKNOWN:            'bg-gray-100 text-gray-500',
-}
-const sc = (code: string) => STATUS_COLORS[code] ?? STATUS_COLORS.UNKNOWN
-
-function fmtDate(d: string | null) {
-  if (!d) return '—'
-  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-}
-function fmtNum(n: number | null, dec = 2) {
-  if (n === null || n === undefined) return '—'
-  return Number(n).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec })
-}
-function fmtQty(n: number) {
-  return Number(n).toLocaleString('en-US', { maximumFractionDigits: 3 })
-}
-function toDateInput(d: string | null) {
-  if (!d) return ''
-  return d.slice(0, 10)
+  PARTIALLY_RELEASED: 'bg-yellow-100 text-yellow-700',
+  FULLY_RELEASED:     'bg-purple-100 text-purple-700',
+  SHIPPED:            'bg-indigo-100 text-indigo-700',
+  DELIVERED:          'bg-green-100 text-green-700',
+  CLOSED:             'bg-gray-100 text-gray-500',
+  CANCELED:           'bg-red-100 text-red-600',
+  IN_TRANSIT:         'bg-indigo-100 text-indigo-700',
+  READY:              'bg-teal-100 text-teal-700',
 }
 
-// ── Section card ─────────────────────────────────────────────
-function Section({ title, icon: Icon, children }: {
-  title: string; icon: React.ElementType; children: React.ReactNode
-}) {
-  return (
-    <div className="bg-white rounded-lg border overflow-hidden">
-      <div className="flex items-center gap-2 px-5 py-3 border-b bg-gray-50">
-        <Icon size={15} className="text-blue-600" />
-        <h2 className="text-sm font-semibold text-gray-700">{title}</h2>
-      </div>
-      <div className="px-5 py-4">{children}</div>
-    </div>
-  )
-}
-
-function Field({ label, value }: { label: string; value: React.ReactNode }) {
+function Field({ label, value, mono = false, highlight = false }: any) {
   return (
     <div>
-      <p className="text-xs text-gray-400 mb-0.5">{label}</p>
-      <p className="text-sm text-gray-800 font-medium">{value || '—'}</p>
+      <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wide mb-0.5">{label}</p>
+      <p className={`text-sm ${mono ? 'font-mono' : ''} ${highlight ? 'font-semibold text-gray-900' : 'text-gray-700'} ${!value ? 'text-gray-300' : ''}`}>
+        {value || '—'}
+      </p>
     </div>
   )
 }
 
-// ── Edit Modal ───────────────────────────────────────────────
-function EditModal({ po, onClose, onSave }: {
-  po: PO
-  onClose: () => void
-  onSave: (updated: Partial<PO>) => void
-}) {
-  const [form, setForm] = useState({
-    source_reference:        po.source_reference || '',
-    requested_ship_date:     toDateInput(po.requested_ship_date),
-    requested_delivery_date: toDateInput(po.requested_delivery_date),
-    hold_flag:               po.hold_flag,
-  })
-  const [saving, setSaving] = useState(false)
-  const [error, setError]   = useState('')
-
-  const inp = "w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-
-  async function handleSave() {
-    setSaving(true)
-    setError('')
-    try {
-      const body: Record<string, unknown> = {}
-      if (form.source_reference        !== (po.source_reference || ''))         body.source_reference        = form.source_reference
-      if (form.requested_ship_date     !== toDateInput(po.requested_ship_date))  body.requested_ship_date     = form.requested_ship_date || null
-      if (form.requested_delivery_date !== toDateInput(po.requested_delivery_date)) body.requested_delivery_date = form.requested_delivery_date || null
-      if (form.hold_flag               !== po.hold_flag)                         body.hold_flag               = form.hold_flag
-
-      if (Object.keys(body).length === 0) { onClose(); return }
-
-      await api.purchaseOrders.update(po.purchase_order_id, body)
-      onSave({ ...body, updated_at: new Date().toISOString() } as Partial<PO>)
-      onClose()
-    } catch {
-      setError('Failed to save changes.')
-    } finally {
-      setSaving(false)
-    }
-  }
-
+function Section({ title, icon: Icon, color = 'text-blue-600', children }: any) {
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
-          <div className="flex items-center gap-2">
-            <Pencil size={16} className="text-blue-600" />
-            <h2 className="text-base font-semibold text-gray-900">Edit {po.purchase_order_number}</h2>
-          </div>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
-            <X size={18} />
-          </button>
-        </div>
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="flex items-center gap-2 px-5 py-3.5 border-b border-gray-100 bg-gray-50">
+        <Icon size={14} className={color} />
+        <h3 className="text-sm font-bold text-gray-700">{title}</h3>
+      </div>
+      <div className="p-5">{children}</div>
+    </div>
+  )
+}
 
-        {/* Fields */}
-        <div className="px-6 py-5 space-y-4">
-          {error && <p className="text-sm text-red-500">{error}</p>}
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Source Reference</label>
-            <input
-              className={inp}
-              value={form.source_reference}
-              onChange={e => setForm({ ...form, source_reference: e.target.value })}
-              placeholder="ERP reference number"
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Requested Ship Date</label>
-              <input
-                type="date"
-                className={inp}
-                value={form.requested_ship_date}
-                onChange={e => setForm({ ...form, requested_ship_date: e.target.value })}
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Requested Delivery Date</label>
-              <input
-                type="date"
-                className={inp}
-                value={form.requested_delivery_date}
-                onChange={e => setForm({ ...form, requested_delivery_date: e.target.value })}
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setForm({ ...form, hold_flag: !form.hold_flag })}
-              className={`w-10 h-5 rounded-full transition-colors ${form.hold_flag ? 'bg-yellow-400' : 'bg-gray-300'}`}
-            >
-              <span className={`block w-4 h-4 bg-white rounded-full shadow transform transition-transform mx-0.5 ${form.hold_flag ? 'translate-x-5' : 'translate-x-0'}`} />
-            </button>
-            <span className="text-sm text-gray-700">On Hold</span>
-            {form.hold_flag && (
-              <span className="text-xs text-yellow-700 bg-yellow-50 px-2 py-0.5 rounded-full">
-                <AlertTriangle size={10} className="inline mr-1" />Hold will be applied
-              </span>
-            )}
-          </div>
-
-          <p className="text-xs text-gray-400 pt-1">
-            To update supplier, buyer, locations, incoterms, or financial terms, use the ERP integration or contact your administrator.
-          </p>
-        </div>
-
-        {/* Footer */}
-        <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-200">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 font-medium"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition"
-          >
-            <Save size={14} />
-            {saving ? 'Saving…' : 'Save Changes'}
-          </button>
-        </div>
+function QuantityBar({ label, value, total, color }: { label: string; value: number; total: number; color: string }) {
+  const pct = total > 0 ? Math.min(value / total * 100, 100) : 0
+  return (
+    <div>
+      <div className="flex justify-between text-xs mb-1">
+        <span className="text-gray-500">{label}</span>
+        <span className="font-semibold text-gray-800">{value?.toLocaleString()}</span>
+      </div>
+      <div className="w-full bg-gray-100 rounded-full h-1.5">
+        <div className={`${color} h-1.5 rounded-full transition-all`} style={{ width: `${pct}%` }} />
       </div>
     </div>
   )
 }
 
-// ── Main component ───────────────────────────────────────────
 export default function PODetailPage() {
-  const params  = useParams<{ po_id: string }>()
-  const router  = useRouter()
-  const [po, setPo]             = useState<PO | null>(null)
-  const [lines, setLines]       = useState<POLine[]>([])
-  const [versions, setVersions] = useState<POVersion[]>([])
-  const [loading, setLoading]   = useState(true)
-  const [error, setError]       = useState('')
-  const [activeTab, setActiveTab] = useState<'lines' | 'versions'>('lines')
-  const [showEdit, setShowEdit] = useState(false)
+  const params = useParams()
+  const router = useRouter()
+  const id = params?.po_id as string
+
+  const [po, setPO] = useState<any>(null)
+  const [lines, setLines] = useState<any[]>([])
+  const [releases, setReleases] = useState<any[]>([])
+  const [versions, setVersions] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState('lines')
 
   useEffect(() => {
-    if (!params.po_id) return
-    setLoading(true)
-    api.purchaseOrders.get(params.po_id)
-      .then((res: { purchase_order: PO; lines: POLine[]; versions: POVersion[] }) => {
-        setPo(res.purchase_order)
-        setLines(res.lines)
-        setVersions(res.versions)
-      })
-      .catch(() => setError('Failed to load purchase order.'))
-      .finally(() => setLoading(false))
-  }, [params.po_id])
-
-  function handleSaved(updated: Partial<PO>) {
-    if (po) setPo({ ...po, ...updated })
-  }
+    if (!id) return
+    Promise.all([
+      apiFetch(`/purchase-orders/${id}`),
+      apiFetch(`/order-releases/?po_id=${id}&limit=50`).catch(() => ({ data: [] })),
+    ]).then(([poData, relData]) => {
+      setPO(poData.purchase_order || poData)
+      setLines(poData.lines || [])
+      setVersions(poData.versions || [])
+      setReleases(relData.data || (Array.isArray(relData) ? relData : []))
+      setLoading(false)
+    }).catch(() => setLoading(false))
+  }, [id])
 
   if (loading) return (
-    <div className="flex items-center justify-center h-64 text-gray-400 text-sm">Loading…</div>
+    <div className="flex items-center justify-center h-full">
+      <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full" />
+    </div>
   )
-  if (error || !po) return (
-    <div className="flex items-center justify-center h-64 text-red-500 text-sm">{error || 'Not found'}</div>
+
+  if (!po) return (
+    <div className="p-6 text-center">
+      <p className="text-gray-500 mb-3">Purchase order not found.</p>
+      <button onClick={() => router.push('/purchase-orders')} className="text-blue-600 text-sm hover:underline">← Back</button>
+    </div>
   )
+
+  // Aggregate quantities across lines
+  const totals = lines.reduce((acc: any, l: any) => ({
+    ordered:   acc.ordered   + (l.ordered_quantity   || 0),
+    released:  acc.released  + (l.released_quantity  || 0),
+    shipped:   acc.shipped   + (l.shipped_quantity   || 0),
+    delivered: acc.delivered + (l.delivered_quantity || 0),
+    remaining: acc.remaining + (l.remaining_quantity || 0),
+    value:     acc.value     + (l.line_value         || 0),
+    weight:    acc.weight    + (l.weight_value       || 0),
+  }), { ordered: 0, released: 0, shipped: 0, delivered: 0, remaining: 0, value: 0, weight: 0 })
+
+  const TABS = [
+    { key: 'lines',    label: 'PO Lines',      icon: Package,  count: lines.length },
+    { key: 'releases', label: 'Order Releases', icon: Layers,   count: releases.length },
+    { key: 'versions', label: 'Version History', icon: Clock,   count: versions.length },
+  ]
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <div className="bg-white border-b px-6 py-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <button onClick={() => router.back()}
-              className="text-gray-400 hover:text-blue-600 transition-colors">
-              <ArrowLeft size={18} />
-            </button>
-            <FileText size={18} className="text-blue-600" />
-            <h1 className="text-xl font-semibold text-gray-800">PO {po.purchase_order_number}</h1>
-            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${sc(po.status_code)}`}>
-              {po.status_name}
-            </span>
-            {po.hold_flag && (
-              <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
-                <AlertTriangle size={11} /> On Hold
+    <div className="p-6 max-w-7xl mx-auto space-y-4">
+      {/* Breadcrumb */}
+      <div className="flex items-center gap-2 text-sm text-gray-500">
+        <button onClick={() => router.push('/purchase-orders')} className="flex items-center gap-1 hover:text-gray-800">
+          <ArrowLeft size={14} /> Purchase Orders
+        </button>
+        <ChevronRight size={14} />
+        <span className="font-mono text-gray-900 font-medium">{po.purchase_order_number}</span>
+      </div>
+
+      {/* ── HEADER ──────────────────────────────────────────────── */}
+      <div className="bg-white rounded-xl border border-gray-200 p-6">
+        <div className="flex items-start justify-between gap-4 mb-5">
+          <div>
+            <div className="flex items-center gap-3 mb-1">
+              <h1 className="text-2xl font-bold text-gray-900 font-mono">{po.purchase_order_number}</h1>
+              <span className={`px-3 py-1 rounded-full text-xs font-semibold ${STATUS_COLORS[po.status_code] || 'bg-gray-100 text-gray-600'}`}>
+                {po.status_name || po.status_code}
               </span>
-            )}
-          </div>
-          {/* Edit button */}
-          <button
-            onClick={() => setShowEdit(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 hover:border-blue-400 hover:text-blue-600 transition"
-          >
-            <Pencil size={14} />
-            Edit PO
-          </button>
-        </div>
-        <p className="text-xs text-gray-400 ml-9 mt-1">
-          v{po.version_number} · Created {fmtDate(po.created_at)} · Updated {fmtDate(po.updated_at)}
-        </p>
-      </div>
-
-      <div className="px-6 py-5 space-y-4">
-        {/* Top row — 3 cols */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <Section title="Parties" icon={Building}>
-            <div className="space-y-3">
-              <div>
-                <p className="text-xs text-gray-400 mb-1">Supplier</p>
-                <p className="text-sm font-semibold text-gray-800">{po.supplier_name || '—'}</p>
-                {po.supplier_code && <p className="text-xs text-gray-400">{po.supplier_code}</p>}
-                {po.supplier_tax_id && <p className="text-xs text-gray-400">Tax: {po.supplier_tax_id}</p>}
-              </div>
-              <div>
-                <p className="text-xs text-gray-400 mb-1">Buyer</p>
-                <p className="text-sm font-semibold text-gray-800">{po.buyer_name || '—'}</p>
-                {po.buyer_code && <p className="text-xs text-gray-400">{po.buyer_code}</p>}
-              </div>
-            </div>
-          </Section>
-
-          <Section title="Locations" icon={MapPin}>
-            <div className="space-y-3">
-              <div>
-                <p className="text-xs text-gray-400 mb-1">Ship From</p>
-                <p className="text-sm font-semibold text-gray-800">{po.ship_from_name || '—'}</p>
-                {po.ship_from_address && <p className="text-xs text-gray-500">{po.ship_from_address}</p>}
-                <p className="text-xs text-gray-500">
-                  {[po.ship_from_city, po.ship_from_state, po.ship_from_zip].filter(Boolean).join(', ')}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-gray-400 mb-1">Ship To</p>
-                <p className="text-sm font-semibold text-gray-800">{po.ship_to_name || '—'}</p>
-                {po.ship_to_address && <p className="text-xs text-gray-500">{po.ship_to_address}</p>}
-                <p className="text-xs text-gray-500">
-                  {[po.ship_to_city, po.ship_to_state, po.ship_to_zip].filter(Boolean).join(', ')}
-                </p>
-              </div>
-            </div>
-          </Section>
-
-          <Section title="Dates & Priority" icon={Clock}>
-            <div className="space-y-3">
-              <Field label="Requested Ship Date"     value={fmtDate(po.requested_ship_date)} />
-              <Field label="Requested Delivery Date" value={fmtDate(po.requested_delivery_date)} />
-              <Field label="Priority"                value={po.priority} />
-              <Field label="PO Type"                 value={po.po_type} />
-            </div>
-          </Section>
-        </div>
-
-        {/* Second row — 2 cols */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Section title="Financial Terms" icon={DollarSign}>
-            <div className="grid grid-cols-2 gap-4">
-              <Field label="Currency"       value={po.currency} />
-              <Field label="Payment Terms"  value={po.payment_terms} />
-              <Field label="Incoterm"       value={po.incoterm} />
-              <Field label="Freight Terms"  value={po.freight_terms} />
-            </div>
-          </Section>
-
-          <Section title="Organisation & Source" icon={Building}>
-            <div className="grid grid-cols-2 gap-4">
-              <Field label="Business Unit" value={po.business_unit} />
-              <Field label="Project"       value={po.project} />
-              <Field label="Cost Center"   value={po.cost_center} />
-              <Field label="Source System" value={po.source_system} />
-              <Field label="Source Ref"    value={po.source_reference} />
-              {po.hold_flag && <Field label="Hold Reason" value={po.hold_reason} />}
-            </div>
-          </Section>
-        </div>
-
-        {/* Lines / Versions tabs */}
-        <div className="bg-white rounded-lg border overflow-hidden">
-          <div className="flex border-b">
-            {(['lines', 'versions'] as const).map(tab => (
-              <button key={tab}
-                onClick={() => setActiveTab(tab)}
-                className={`px-5 py-3 text-sm font-medium transition-colors border-b-2 ${
-                  activeTab === tab
-                    ? 'border-blue-600 text-blue-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700'
-                }`}
-              >
-                {tab === 'lines' ? `Lines (${lines.length})` : `Version History (${versions.length})`}
-              </button>
-            ))}
-          </div>
-
-          {activeTab === 'lines' && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="bg-gray-50 border-b text-left text-gray-600">
-                    <th className="px-3 py-2.5 font-medium">#</th>
-                    <th className="px-3 py-2.5 font-medium">Item</th>
-                    <th className="px-3 py-2.5 font-medium">Status</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Ordered</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Releasable</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Released</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Planned</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Shipped</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Delivered</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Received</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Cancelled</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Remaining</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Weight</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Volume</th>
-                    <th className="px-3 py-2.5 font-medium text-right">Line Value</th>
-                    <th className="px-3 py-2.5 font-medium">Freight Class</th>
-                    <th className="px-3 py-2.5 font-medium">Packaging</th>
-                    <th className="px-3 py-2.5 font-medium">Haz</th>
-                    <th className="px-3 py-2.5 font-medium">Temp Req</th>
-                    <th className="px-3 py-2.5 font-medium">Ship Date</th>
-                    <th className="px-3 py-2.5 font-medium">Dlv Date</th>
-                    <th className="px-3 py-2.5 font-medium">Hold</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {lines.length === 0 && (
-                    <tr><td colSpan={22} className="px-3 py-8 text-center text-gray-400">No lines</td></tr>
-                  )}
-                  {lines.map((l, i) => (
-                    <tr key={l.purchase_order_line_id}
-                      className={`border-b last:border-0 ${i % 2 === 0 ? 'bg-white' : 'bg-gray-50/50'}`}>
-                      <td className="px-3 py-2 font-mono text-gray-600">{l.line_number}</td>
-                      <td className="px-3 py-2">
-                        <p className="font-medium text-gray-800">{l.item_number || l.item_name || '—'}</p>
-                        {l.item_description && <p className="text-gray-400 text-xs">{l.item_description}</p>}
-                      </td>
-                      <td className="px-3 py-2">
-                        <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${sc(l.status_code)}`}>
-                          {l.status_name}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.ordered_quantity)} <span className="text-gray-400">{l.quantity_uom}</span></td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.releasable_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.released_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.planned_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.shipped_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.delivered_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.received_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{fmtQty(l.canceled_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums font-semibold text-blue-700">{fmtQty(l.remaining_quantity)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{l.weight_value ? `${fmtNum(l.weight_value, 3)} ${l.weight_uom}` : '—'}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{l.volume_value ? `${fmtNum(l.volume_value, 3)} ${l.volume_uom}` : '—'}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{l.line_value ? `${l.currency} ${fmtNum(l.line_value)}` : '—'}</td>
-                      <td className="px-3 py-2">{l.freight_class || '—'}</td>
-                      <td className="px-3 py-2">{l.packaging_type || '—'}</td>
-                      <td className="px-3 py-2 text-center">
-                        {l.hazardous_flag
-                          ? <AlertTriangle size={13} className="text-red-500 mx-auto" />
-                          : <CheckCircle  size={13} className="text-green-400 mx-auto" />}
-                      </td>
-                      <td className="px-3 py-2">{l.temperature_requirement || '—'}</td>
-                      <td className="px-3 py-2">{fmtDate(l.requested_ship_date)}</td>
-                      <td className="px-3 py-2">{fmtDate(l.requested_delivery_date)}</td>
-                      <td className="px-3 py-2 text-center">
-                        {l.hold_flag && <AlertTriangle size={13} className="text-yellow-500 mx-auto" />}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {activeTab === 'versions' && (
-            <div className="px-5 py-4">
-              {versions.length === 0 && (
-                <p className="text-sm text-gray-400 text-center py-6">No version history recorded</p>
+              {po.hold_flag && (
+                <span className="px-2 py-0.5 bg-red-100 text-red-700 text-xs rounded-full font-medium flex items-center gap-1">
+                  <AlertTriangle size={10} /> On Hold
+                </span>
               )}
-              <div className="space-y-3">
-                {versions.map(v => (
-                  <div key={v.version_number} className="flex items-start gap-3 py-3 border-b last:border-0">
-                    <History size={14} className="text-gray-400 mt-0.5" />
-                    <div>
-                      <p className="text-sm font-medium text-gray-700">Version {v.version_number}</p>
-                      {v.change_reason && <p className="text-xs text-gray-500">{v.change_reason}</p>}
-                      <p className="text-xs text-gray-400 mt-0.5">
-                        {v.created_by && `${v.created_by} · `}{fmtDate(v.created_at)}
-                      </p>
-                    </div>
-                  </div>
+            </div>
+            <p className="text-sm text-gray-500">
+              {po.po_type || 'Standard'} · Version {po.version_number || 1} · {po.priority && `Priority: ${po.priority}`}
+            </p>
+          </div>
+          <div className="text-right flex-shrink-0">
+            <p className="text-2xl font-bold text-gray-900">{fmtCurrency(totals.value)}</p>
+            <p className="text-xs text-gray-400 mt-0.5">{po.currency || 'USD'} · {po.payment_terms}</p>
+          </div>
+        </div>
+
+        {/* Quantity summary */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 p-4 bg-gray-50 rounded-xl mb-5">
+          <QuantityBar label="Ordered" value={totals.ordered} total={totals.ordered} color="bg-gray-400" />
+          <QuantityBar label="Released" value={totals.released} total={totals.ordered} color="bg-blue-500" />
+          <QuantityBar label="Shipped" value={totals.shipped} total={totals.ordered} color="bg-indigo-500" />
+          <QuantityBar label="Delivered" value={totals.delivered} total={totals.ordered} color="bg-green-500" />
+        </div>
+
+        {/* Key fields */}
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-5">
+          <Field label="Supplier" value={po.supplier_name} highlight />
+          <Field label="Supplier Code" value={po.supplier_code} mono />
+          <Field label="Buyer / Customer" value={po.buyer_name} highlight />
+          <Field label="Buyer Code" value={po.buyer_code} mono />
+          <Field label="Source Reference" value={po.source_reference} mono />
+          <Field label="Incoterm" value={po.incoterm} />
+          <Field label="Freight Terms" value={po.freight_terms} />
+          <Field label="Payment Terms" value={po.payment_terms} />
+          <Field label="Requested Ship" value={fmtDate(po.requested_ship_date)} />
+          <Field label="Requested Delivery" value={fmtDate(po.requested_delivery_date)} />
+          <Field label="Business Unit" value={po.business_unit} />
+          <Field label="Cost Center" value={po.cost_center} />
+        </div>
+
+        {/* Ship from / to */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-5 pt-5 border-t border-gray-100">
+          <div className="flex gap-3">
+            <div className="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5">
+              <Building2 size={14} className="text-blue-600" />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">Ship From</p>
+              <p className="text-sm font-semibold text-gray-800">{po.ship_from_name}</p>
+              <p className="text-xs text-gray-500">{po.ship_from_address}</p>
+              <p className="text-xs text-gray-500">{[po.ship_from_city, po.ship_from_state, po.ship_from_zip].filter(Boolean).join(', ')}</p>
+            </div>
+          </div>
+          <div className="flex gap-3">
+            <div className="w-8 h-8 bg-green-50 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5">
+              <MapPin size={14} className="text-green-600" />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">Ship To</p>
+              <p className="text-sm font-semibold text-gray-800">{po.ship_to_name}</p>
+              <p className="text-xs text-gray-500">{po.ship_to_address}</p>
+              <p className="text-xs text-gray-500">{[po.ship_to_city, po.ship_to_state, po.ship_to_zip].filter(Boolean).join(', ')}</p>
+            </div>
+          </div>
+        </div>
+
+        {po.hold_flag && po.hold_reason && (
+          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+            <AlertTriangle size={14} className="text-red-500 mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="text-xs font-semibold text-red-700">Hold Reason</p>
+              <p className="text-xs text-red-600 mt-0.5">{po.hold_reason}</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── TABS ────────────────────────────────────────────────── */}
+      <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+        {TABS.map(t => (
+          <button key={t.key} onClick={() => setActiveTab(t.key)}
+            className={`flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+            <t.icon size={13} /> {t.label}
+            {t.count > 0 && (
+              <span className="text-xs px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600 font-semibold">{t.count}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* ── PO LINES ──────────────────────────────────────────────  */}
+      {activeTab === 'lines' && (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b border-gray-200">
+              <tr>
+                {['Line','Item #','Description','Ordered','Released','Shipped','Delivered','Remaining','Value','Status'].map(h => (
+                  <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
                 ))}
-              </div>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {lines.length === 0 ? (
+                <tr><td colSpan={10} className="text-center py-12 text-gray-400">No PO lines found</td></tr>
+              ) : lines.map((line: any) => (
+                <tr key={line.purchase_order_line_id} className="hover:bg-gray-50 transition-colors">
+                  <td className="px-4 py-3 font-mono text-xs text-gray-500">{line.line_number}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-blue-600">{line.item_number}</td>
+                  <td className="px-4 py-3">
+                    <p className="font-medium text-gray-800 text-sm">{line.item_name || line.item_description}</p>
+                    {line.item_name !== line.item_description && (
+                      <p className="text-xs text-gray-400">{line.item_description}</p>
+                    )}
+                    <div className="flex items-center gap-2 mt-1">
+                      {line.hazardous_flag && <span className="text-[10px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">HAZ</span>}
+                      {line.temperature_requirement && <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-medium">TEMP</span>}
+                      {line.packaging_type && <span className="text-[10px] text-gray-400">{line.packaging_type}</span>}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-gray-700 font-medium">{line.ordered_quantity?.toLocaleString()} <span className="text-xs text-gray-400">{line.quantity_uom}</span></td>
+                  <td className="px-4 py-3 text-blue-600">{line.released_quantity?.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-indigo-600">{line.shipped_quantity?.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-green-600">{line.delivered_quantity?.toLocaleString()}</td>
+                  <td className="px-4 py-3">
+                    <span className={`font-semibold ${line.remaining_quantity > 0 ? 'text-orange-600' : 'text-gray-400'}`}>
+                      {line.remaining_quantity?.toLocaleString()}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 font-medium text-gray-800">{fmtCurrency(line.line_value)}</td>
+                  <td className="px-4 py-3">
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${STATUS_COLORS[line.status_code] || 'bg-gray-100 text-gray-600'}`}>
+                      {line.status_name || line.status_code}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            {lines.length > 0 && (
+              <tfoot className="bg-gray-50 border-t border-gray-200">
+                <tr>
+                  <td colSpan={3} className="px-4 py-3 text-xs font-bold text-gray-600 uppercase">Totals</td>
+                  <td className="px-4 py-3 text-sm font-bold text-gray-900">{totals.ordered.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-sm font-bold text-blue-600">{totals.released.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-sm font-bold text-indigo-600">{totals.shipped.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-sm font-bold text-green-600">{totals.delivered.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-sm font-bold text-orange-600">{totals.remaining.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-sm font-bold text-gray-900">{fmtCurrency(totals.value)}</td>
+                  <td />
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      )}
+
+      {/* ── ORDER RELEASES ──────────────────────────────────────── */}
+      {activeTab === 'releases' && (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {releases.length === 0 ? (
+            <div className="p-10 text-center">
+              <Layers size={32} className="text-gray-200 mx-auto mb-3" />
+              <p className="text-sm text-gray-400">No order releases created yet</p>
+              <Link href="/order-releases"
+                className="inline-flex items-center gap-1.5 mt-3 text-sm text-blue-600 hover:underline">
+                Go to Order Releases <ExternalLink size={12} />
+              </Link>
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b border-gray-200">
+                <tr>
+                  {['Release #','Customer','Origin','Destination','Ship Date','Delivery','Mode','Lines','Status'].map(h => (
+                    <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {releases.map((r: any) => (
+                  <tr key={r.order_release_id} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 font-mono text-sm text-blue-600">
+                      <Link href={`/order-releases/${r.order_release_id}`}>{r.order_release_number}</Link>
+                    </td>
+                    <td className="px-4 py-3 text-gray-700">{r.customer_name || '—'}</td>
+                    <td className="px-4 py-3 text-xs text-gray-500">{r.shipper_city ? `${r.shipper_city}, ${r.shipper_state}` : '—'}</td>
+                    <td className="px-4 py-3 text-xs text-gray-500">{r.consignee_city ? `${r.consignee_city}, ${r.consignee_state}` : '—'}</td>
+                    <td className="px-4 py-3 text-gray-500">{fmtDate(r.requested_ship_date)}</td>
+                    <td className="px-4 py-3 text-gray-500">{fmtDate(r.requested_delivery_date)}</td>
+                    <td className="px-4 py-3 text-gray-600 uppercase text-xs">{r.transport_mode || '—'}</td>
+                    <td className="px-4 py-3 text-gray-600">{r.line_count || '—'}</td>
+                    <td className="px-4 py-3">
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${STATUS_COLORS[r.status_code] || 'bg-gray-100 text-gray-600'}`}>
+                        {r.status_name || r.status_code}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* ── VERSION HISTORY ─────────────────────────────────────── */}
+      {activeTab === 'versions' && (
+        <div className="bg-white rounded-xl border border-gray-200 p-5">
+          {versions.length === 0 ? (
+            <div className="text-center py-8">
+              <Clock size={28} className="text-gray-200 mx-auto mb-3" />
+              <p className="text-sm text-gray-400">No version history available</p>
+              <p className="text-xs text-gray-300 mt-1">Version {po.version_number || 1} is the current version</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {versions.map((v: any, i: number) => (
+                <div key={i} className="flex items-start gap-4 p-4 bg-gray-50 rounded-lg">
+                  <div className="w-8 h-8 bg-white border border-gray-200 rounded-full flex items-center justify-center text-xs font-bold text-gray-600 flex-shrink-0">
+                    v{v.version_number}
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-gray-800">{v.change_reason || 'Version update'}</p>
+                    <p className="text-xs text-gray-500 mt-0.5">{fmtDate(v.created_at)} · {v.created_by}</p>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>
-      </div>
-
-      {/* Edit modal */}
-      {showEdit && (
-        <EditModal
-          po={po}
-          onClose={() => setShowEdit(false)}
-          onSave={handleSaved}
-        />
       )}
     </div>
   )
